@@ -1,0 +1,1506 @@
+---
+title: "Burden or Builders? (Replication Package)"
+authors: "Sepehr Ekbatani, Mohammad Mostafawi"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+        theme: readable    
+        highlight: kate
+        toc: true    
+        toc_depth: 4
+        toc_float: true    
+        df_print: kable
+        code_folding: hide    
+        css: styles.css
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+# Set global options
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+
+
+```
+
+```{r,include=FALSE}
+library("RODBC")
+library("tibble")
+library("dplyr")
+library("ggplot2")
+library("reshape2")
+library("sf")
+library("shiny")
+library("leaflet")
+library("kableExtra")
+library("knitr")
+library("data.table")  
+library("tidyr")
+library("haven")
+library("purrr")
+library("stringr")
+library("readxl")
+library("readr")
+library("broom")
+library("AER")
+library("sandwich")
+library("lmtest")
+library("fixest")
+library("dplyr")
+library("purrr")
+library("writexl") 
+library("readxl")
+library("xtable")
+library("stargazer")
+library("multiwayvcov")
+library("survey")
+library("htmltools")
+```
+
+
+# Demand Side Analysis
+
+## Importing and Basic Cleanings
+
+```{r, message=FALSE}
+##  Import HEIS + basic recodes
+## =========================
+
+expenditure_all <- read_dta("HEIS.dta")
+
+expenditure_all <- expenditure_all %>%
+  mutate(
+    # Make sure marital status is numeric, then collapse 2/3/4 into 0 (non-category-1)
+    Marital_Status_HH_Head = as.numeric(Marital_Status_HH_Head),
+    Marital_Status_HH_Head = ifelse(Marital_Status_HH_Head %in% c(2, 3, 4),
+                                    0,
+                                    Marital_Status_HH_Head)
+  )
+
+# Log of main expenditure aggregates (add 1 to handle zeros)
+expenditure_all$log_housing       <- log(expenditure_all$housing       + 1)
+expenditure_all$log_food          <- log(expenditure_all$food          + 1)
+expenditure_all$log_durables      <- log(expenditure_all$durables      + 1)
+expenditure_all$log_education     <- log(expenditure_all$education     + 1)
+expenditure_all$log_transportation<- log(expenditure_all$transportation+ 1)
+
+
+## =========================
+## Province-level controls and population
+## =========================
+
+all_populations <- read_dta("LFS.dta")
+
+# Harmonise province codes across files
+expenditure_all <- expenditure_all %>%
+  mutate(province = as.numeric(province))
+
+
+all_populations <- all_populations %>%
+  mutate(
+    province = as.numeric(province),
+    year     = as.numeric(year)
+  )
+# Important note: There are two columns of years in this data: "Year" and "year"
+# "Year" is in Gregorian Calendar and "year" is in Persian Solar Calendar
+# "Year" is from 2018 to 2023 and "year" is from 1397 to 1402 in Persian Calendar
+
+
+
+## =========================
+## Clean population file and merge
+## =========================
+
+# Align province name to match other files
+all_populations <- all_populations %>%
+  rename(Province = province_name)
+
+# Fix mixed coding of Persian year (e.g. 99 → 1399, 400 → 1400)
+all_populations <- all_populations %>%
+  mutate(
+    year = case_when(
+      year < 100                   ~ 1300 + year,        # e.g. 99  → 1399
+      year >= 400 & year < 500     ~ 1000 + year,        # e.g. 400 → 1400
+      TRUE                         ~ year
+    )
+  )
+
+# Rename the dataset of HEIS
+consumption <- expenditure_all
+# Add population data to the main file
+consumption <- consumption %>%
+  left_join(all_populations, by = c("province", "Province", "year"))
+
+
+## =========================
+## Night-time lights, land area, and population density
+## =========================
+
+# NTL data at province-year level
+Iran_ntl <- read_csv("Iran_ntl.csv")
+
+# Merge NTL into the main file (keys must match how they are stored in the raw files)
+consumption <- consumption %>%
+  left_join(Iran_ntl, by = c("Province", "Year"))
+
+# Province land area (km²)
+iran_province_areas <- read_csv("Iran_province_areas.csv")
+
+consumption <- consumption %>%
+  left_join(iran_province_areas, by = "Province") %>%
+  mutate(
+    # Population density: total population per km²
+    pop_density = total_pop / Area_km2
+  )
+
+
+
+
+
+```
+
+
+## Summary Stats
+### Table 1: consumption Summary stat 
+
+```{r}
+## ==================================================
+## Summary statistics: consumption data (analysis sample)
+## ==================================================
+
+# Reconstruct total consumption (replace old total)
+consumption <- consumption %>% 
+  mutate(
+    total = food +
+            catering_food +
+            housing +
+            education +
+            transportation +
+            communication +
+            durables +
+            health,
+    
+    # log(total + 1) to avoid log(0) cases
+    log_total = log(total + 1)
+  )
+
+# Fix miscoded income earners and numeric issues
+consumption <- consumption %>%
+  mutate(
+    Num_Income_Earners = ifelse(Num_Income_Earners == 99, 0, Num_Income_Earners),
+    nroom = as.numeric(as.character(nroom)),
+    floor = as.numeric(as.character(floor))
+  )
+
+# Variables for the table (same as before, but log_total updated)
+vars_summ <- c(
+  "log_housing","log_total","log_food",
+  "log_durables","log_education","log_transportation",
+  "nroom","floor",
+  "afghan_pct",
+  "Num_HH_Members","Num_Male","Num_Under14",
+  "Num_Over65","Num_Income_Earners",
+  "ntl","pop_density"
+)
+vars_summ <- intersect(vars_summ, names(consumption))
+
+
+# Analysis sample
+cons_sample <- consumption %>%
+  filter(year %in% 1397:1402) %>%
+  filter(complete.cases(across(all_of(c(vars_summ, "weight")))))
+
+
+# Weighted summary function
+summ_fun_w <- function(x, w) {
+  x <- as.numeric(x)
+  w <- as.numeric(w)
+
+  w <- w / sum(w)  # normalize
+
+  # weighted percentiles
+  ord <- order(x)
+  x_sorted <- x[ord]
+  w_sorted <- w[ord]
+  cum_w <- cumsum(w_sorted)
+
+  w_quant <- function(p) x_sorted[which(cum_w >= p)[1]]
+
+  c(
+    N    = length(x),
+    mean = sum(w * x),
+    sd   = sqrt(sum(w * (x - sum(w * x))^2)),
+    min  = min(x),
+    p25  = w_quant(0.25),
+    p50  = w_quant(0.50),
+    p75  = w_quant(0.75),
+    max  = max(x)
+  )
+}
+
+# Build weighted summary table
+cons_summary_table <- t(
+  sapply(vars_summ, function(v)
+    summ_fun_w(cons_sample[[v]], cons_sample$weight)
+  )
+)
+
+cons_summary_table <- as.data.frame(cons_summary_table)
+rownames(cons_summary_table) <- vars_summ
+
+# Show in R
+print(round(cons_summary_table, 3))
+
+# Export to LaTeX
+cons_summary_tex <- capture.output(
+  stargazer(
+    cons_summary_table,
+    type = "latex",
+    summary  = FALSE,
+    header   = FALSE,
+    rownames = TRUE,
+    title = "Weighted summary statistics: household consumption sample",
+    label = "tab:summary_consumption",
+    digits = 3
+  )
+)
+
+cat(cons_summary_tex, sep = "\n",
+    file = "table_summary_consumption.tex")
+
+
+```
+
+
+
+
+
+
+### Table 3: IV-DiD (Main Analysis)
+
+### Two IV's, Banned and afghan_share96 which shows the percentage of afghans in each province from total afghans in year 1996 
+
+
+
+```{r}
+## ==================================================
+##  Baseline DiD (no IV) and IV–DiD (two IVs)
+##    + export to LaTeX as Table 1 (Panel A/B)
+## ==================================================
+
+consumption <- consumption %>%
+  filter(year %in% 1397:1402) %>%
+  filter(complete.cases(across(all_of(c(vars_summ, "weight")))))
+
+
+
+##  Construct afghan_share96 (province share of total Afghans in 1996)
+consumption <- consumption %>%
+  group_by(Province) %>%
+  mutate(
+    # Provincial Afghan count in 1996 (same within province)
+    Afghans_prov = first(Afghans)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Total Afghan population in 1996 across provinces
+    total_Afghans_1996 = sum(Afghans_prov, na.rm = TRUE),
+    # Province share of national Afghan total
+    afghan_share96      = Afghans_prov / total_Afghans_1996
+  ) %>%
+  select(-Afghans_prov, -total_Afghans_1996)
+
+
+##  Define banned provinces (for second IV)
+forbidden_provinces <- c(
+  "East Azerbaijan","West Azerbaijan","Ardabil","Zanjan",
+  "Kurdistan","Kermanshah","Ilam","Chaharmahal and Bakhtiari",
+  "Kohgiluyeh and Boyer-Ahmad","North Khorasan","Gilan",
+  "Mazandaran","Sistan and Baluchestan","Khuzestan",
+  "Hamadan","Lorestan"
+)
+
+# List of controls (Year and Province included for FE)
+ctrls <- c(
+  "ur","Num_HH_Members","Num_Male",
+  "Num_Under14","Num_Over65",
+  "Education_Level_HH_Head","Marital_Status_HH_Head",
+  "ntl","pop_density","Year","Province"
+)
+
+# Build RHS of controls with explicit factor() for categorical vars
+cat_vars <- c("ur","Education_Level_HH_Head","Marital_Status_HH_Head","Year","Province")
+num_vars <- setdiff(ctrls, cat_vars)
+ctrl_rhs <- paste(
+  c(sprintf("factor(%s)", cat_vars), num_vars),
+  collapse = " + "
+)
+
+# Outcomes
+outcomes <- c(
+  "log_housing","log_total","log_food",
+  "log_durables","log_education","log_transportation",
+  "nroom","floor"
+)
+
+
+##  Clean numeric variables that may be stored as strings
+consumption <- consumption %>%
+  mutate(
+    nroom = as.numeric(as.character(nroom)),
+    floor = as.numeric(as.character(floor))
+  )
+
+
+##  Treatment indicators and instruments
+
+# Post-period dummy (Persian calendar)
+consumption$post <- as.integer(consumption$year %in% c( 1400,1401, 1402))
+
+# Endogenous treatment: post × Afghan share
+consumption$treat_endog <- consumption$post * consumption$afghan_pct
+
+# Banned provinces indicator
+consumption$Province <- as.character(consumption$Province)
+consumption$banned   <- as.integer(consumption$Province %in% forbidden_provinces)
+consumption$Province <- factor(consumption$Province)
+
+# IV 1: post × afghan_share96
+consumption$instr_iv <- consumption$post * consumption$afghan_share96
+
+# IV 2: post × banned
+consumption$instr_banned <- consumption$post * consumption$banned
+# containers for models and clustered SEs
+ols_models <- list()   # baseline DiD
+ols_ses    <- list()
+
+iv_models  <- list()   # IV–DiD (2SLS)
+iv_ses     <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Outcome:", y, "\n")
+  cat("======================================\n")
+
+  # same sample definition for OLS and IV (so results are comparable)
+  needed <- unique(c(
+    y, "post","afghan_pct","treat_endog",
+    "instr_iv","instr_banned",
+    ctrls, "weight"
+  ))
+  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+
+  ## ----------  Baseline DiD (no IV) ----------
+  # OLS: outcome on afghan_pct + treat_endog + controls + Year/Province FE
+  fml_ols <- as.formula(paste0(
+    y, " ~  + ", ctrl_rhs, " + treat_endog"
+  ))
+
+  m_ols <- lm(fml_ols, data = dsub, weights = weight)
+  vc_ols <- vcovCL(m_ols, cluster = ~ Province)
+  se_ols <- sqrt(diag(vc_ols))
+
+  ols_models[[y]] <- m_ols
+  ols_ses[[y]]    <- se_ols
+
+  ## ----------  IV–DiD (two IVs) ----------
+  # 2SLS: treat_endog instrumented by instr_iv & instr_banned
+  fml_iv <- as.formula(paste0(
+    y, " ~  + ", ctrl_rhs, " + treat_endog | ",
+    " + ", ctrl_rhs, " + instr_iv + instr_banned"
+  ))
+
+  m_iv <- ivreg(fml_iv, data = dsub, weights = weight)
+  vc_iv <- vcovCL(m_iv, cluster = ~ Province)
+  se_iv <- sqrt(diag(vc_iv))
+
+  iv_models[[y]] <- m_iv
+  iv_ses[[y]]    <- se_iv
+
+  # print IV results to console (clustered by Province)
+  cat("\n--- IV–DiD (clustered SE, Province) ---\n")
+  print(coeftest(m_iv, vcov = vc_iv))
+  # =====  First-stage joint F for instr_iv & instr_banned =====
+  # First-stage regression: treat_endog on instruments + controls
+  fml_fs <- as.formula(paste0(
+    "treat_endog ~ instr_iv + instr_banned + ", ctrl_rhs
+  ))
+
+  fs <- lm(fml_fs, data = dsub, weights = weight)
+
+  cat("\n-- Province-clustered first-stage joint F (instr_iv & instr_banned) --\n")
+  fs_F <- waldtest(
+    fs,
+    . ~ . - instr_iv - instr_banned,
+    vcov = vcovCL(fs, cluster = ~ Province),
+    test = "F"
+  )
+  print(fs_F)
+}
+
+# keep models in outcome order
+ols_models_list <- unname(ols_models[outcomes])
+ols_ses_list    <- unname(ols_ses[outcomes])
+
+iv_models_list  <- unname(iv_models[outcomes])
+iv_ses_list     <- unname(iv_ses[outcomes])
+
+## ==================================================
+##  Build LaTeX for Table 1 (Panel A / Panel B)
+## ==================================================
+
+# Panel A: Baseline DiD (no IV)
+# only treatment coefficient shown; FE & controls omitted from table
+panelA_latex <- capture.output(
+  stargazer(
+    ols_models_list,
+    se = ols_ses_list,
+    type = "latex",
+    header = FALSE,
+    table  = FALSE,
+    title  = "Panel A: Baseline DiD (no IV)",
+    dep.var.labels.include = FALSE,
+    column.labels  = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    omit = c("factor\\(", "afghan_pct"),   # hide FE + main share; keep DiD term
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# Panel B: IV–DiD (2SLS with two instruments)
+panelB_latex <- capture.output(
+  stargazer(
+    iv_models_list,
+    se = iv_ses_list,
+    type = "latex",
+    header = FALSE,
+    table  = FALSE,
+    title  = "Panel B: IV–DiD (2SLS, instruments: post×afghan\\_share96, post×banned)",
+    dep.var.labels.include = FALSE,
+    column.labels  = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    omit = c("factor\\(", "afghan_pct"),   # same omission rule as Panel A
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share (IV)",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# write combined table to a single .tex file
+table1_file <- "table_consumption_did_iv.tex"
+
+cat(
+  "% ==================================================\n",
+  "% Table 1: Baseline DiD and IV–DiD\n",
+  "% ==================================================\n",
+  "\\begin{table}[ht]\\centering\n",
+  "\\caption{Baseline DiD and IV–DiD estimates}\n",
+  "\\label{tab:did_ivdid}\n\n",
+  "% -------- Panel A --------\n",
+  "\\textbf{Panel A: Baseline DiD (no IV)}\\\\[0.5em]\n",
+  paste(panelA_latex, collapse = "\n"), "\n\n",
+  "% -------- Panel B --------\n",
+  "\\vspace{1em}\n",
+  "\\textbf{Panel B: IV--DiD (2SLS)}\\\\[0.5em]\n",
+  paste(panelB_latex, collapse = "\n"), "\n",
+  "\\end{table}\n",
+  file = table1_file
+)
+
+
+
+```
+
+
+
+### Table 5(Appendix): DiD 
+```{r}
+
+ ## ==================================================
+## Continuous DiD: Afghan pre-settlement exposure × post
+## ==================================================
+
+# Post dummy: 1400–1402 are post
+consumption$post_did <- as.integer(consumption$year %in% c(1400, 1401, 1402))
+
+# Continuous DiD treatment: pre-settlement share × post
+# (afghan_share75 is the pre-settlement exposure)
+# Rename the pre-settlement exposure variable (old: afghan_share75)
+consumption <- consumption %>%
+  mutate (afghan_settlement_pct96 = afghan_share75 * 100)
+
+# afghan_settlement_share96:
+#   Share of Afghans in each province relative to the *province's total population* in 1996.
+#   This is the "pre-settlement exposure" variable used in the DiD identification strategy
+#   (similar to Rozo 2021). Higher values indicate provinces that historically hosted a
+#   larger Afghan presence relative to their own native population.
+
+# Note the difference from afghan_share96 (used in the IV-DiD):
+#   - afghan_settlement_share96 = Afghans_prov_1996 / total_population_prov_1996
+#       → exposure of the *local population* to Afghans historically.
+#
+#   - afghan_share96 = Afghans_prov_1996 / total_Afghans_1996
+#       → province's share of the *national Afghan population* in 1996.
+
+consumption$treat_did <- consumption$post_did * consumption$afghan_settlement_pct96
+
+
+# Containers for models and clustered SEs
+did_models <- list()
+did_ses    <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # DiD specification:
+  #   - treat_did is the key DiD term: afghan_share75 × post_did
+  #   - ctrl_rhs already includes Year and Province FE and other controls
+  fml <- as.formula(paste0(
+    y, " ~ treat_did + ", ctrl_rhs
+  ))
+  
+  needed <- unique(c(
+    y,
+    "treat_did",
+    ctrls,
+    "weight",
+    "afghan_settlement_pct96"
+  ))
+  
+  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  
+  # Weighted OLS with clustered SE at Province level
+  m  <- lm(fml, data = dsub, weights = weight)
+  vc <- vcovCL(m, cluster = ~ Province)
+  
+  did_models[[y]] <- m
+  did_ses[[y]]    <- sqrt(diag(vc))
+  
+  # Print regression with clustered SE
+  print(coeftest(m, vcov = vc))
+}
+
+# Keep models in the same order as "outcomes"
+did_models_list <- unname(did_models[outcomes])
+did_ses_list    <- unname(did_ses[outcomes])
+
+
+## ==================================================
+## LaTeX table: Continuous DiD (Afghan pre-settlement × post)
+## ==================================================
+
+did_table_tex <- capture.output(
+  stargazer(
+    did_models_list,
+    se = did_ses_list,
+    type = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Continuous DiD: Afghan pre-settlement exposure and consumption outcomes",
+    label   = "tab:did_afghan_share75",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep = "treat_did",
+    covariate.labels = "Post × Afghan pre-settlement exposure",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# Write LaTeX file
+cat(did_table_tex, sep = "\n",
+    file = "table_did_afghan_pct96.tex")
+
+
+
+```
+
+
+
+### Figure 6: Event Study
+
+
+
+```{r}
+## ==================================================
+## Dynamic DiD (event study):
+## Afghan pre-settlement exposure × Year (2020 ref.)
+## ==================================================
+
+
+# Years in the panel (Gregorian)
+years_all <- sort(unique(consumption$Year))
+ref_year  <- 2020L
+
+# Years that get their own interaction terms (all except 2020)
+es_years <- years_all[years_all != ref_year]
+
+# For each year t ≠ 2020 define:
+#   treat_es_t = afghan_settlement_share96 * 1{Year == t}
+# There is deliberately NO treat_es_2020 → β_2020 is normalized to zero.
+for (yr in es_years) {
+  varname <- paste0("treat_es_", yr)
+  consumption[[varname]] <- ifelse(
+    consumption$Year == yr,
+    consumption$afghan_settlement_pct96,
+    0
+  )
+}
+
+treat_es_vars <- paste0("treat_es_", es_years)
+
+# Containers for models and clustered vcov
+es_models <- list()
+es_ses    <- list()
+es_vcovs  <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Dynamic DiD – Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # Event-study specification:
+  #   y_pyt = sum_{t≠2020} β_t * (afghan_settlement_share96_p × 1{Year_t})
+  #           + Province FE + Year FE + controls + ε
+  fml_es <- as.formula(paste0(
+    y, " ~ ", ctrl_rhs, " + ", paste(treat_es_vars, collapse = " + ")
+  ))
+  
+  needed <- unique(c(
+    y,
+    "afghan_settlement_pct96",
+    "Year",
+    ctrls,
+    "weight",
+    treat_es_vars
+  ))
+  
+  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  
+  m_es  <- lm(fml_es, data = dsub, weights = weight)
+  vc_es <- vcovCL(m_es, cluster = ~ Province)
+  
+  es_models[[y]] <- m_es
+  es_ses[[y]]    <- sqrt(diag(vc_es))
+  es_vcovs[[y]]  <- vc_es
+  
+  print(coeftest(m_es, vcov = vc_es))
+}
+
+es_models_list <- unname(es_models[outcomes])
+es_ses_list    <- unname(es_ses[outcomes])
+es_vcovs_list  <- unname(es_vcovs[outcomes])
+
+
+## ==================================================
+## LaTeX table: Dynamic DiD (event study)
+## ==================================================
+
+es_table_tex <- capture.output(
+  stargazer(
+    es_models_list,
+    se     = es_ses_list,
+    type   = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Dynamic DiD (event study) with Afghan pre-settlement exposure",
+    label   = "tab:event_study_afghan_settlement",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep   = "treat_es_",
+    notes  = "Cluster-robust standard errors at the province level in parentheses. Year 2020 is the reference period (effect normalized to zero)."
+  )
+)
+
+cat(es_table_tex, sep = "\n",
+    file = "table_event_study_afghan_settlement.tex")
+
+event_study_table_tex <- es_table_tex   # keep in environment
+
+
+## ==================================================
+## Event-study plot (faceted, 2020 = 0)
+## ==================================================
+
+# Extract dynamic coefficients for one model
+extract_es <- function(mod, vcov_mat, ref_year) {
+  cf   <- coef(mod)
+  vcv  <- diag(vcov_mat)
+  nm   <- names(cf)
+  
+  idx  <- grep("^treat_es_", nm)
+  if (length(idx) == 0) return(NULL)
+  
+  beta <- cf[idx]
+  se   <- sqrt(vcv[idx])
+  
+  years <- as.integer(sub("treat_es_", "", nm[idx]))
+  
+  df_es <- data.frame(
+    year  = years,
+    beta  = beta,
+    se    = se
+  )
+  
+  df_es$lower <- df_es$beta - 1.96 * df_es$se
+  df_es$upper <- df_es$beta + 1.96 * df_es$se
+  
+  # Add the reference year (2020) with zero effect and no CI
+  df_es <- rbind(
+    df_es,
+    data.frame(
+      year  = ref_year,
+      beta  = 0,
+      se    = NA_real_,
+      lower = NA_real_,
+      upper = NA_real_
+    )
+  )
+  
+  df_es[order(df_es$year), ]
+}
+
+# Build a single data frame for all outcomes
+es_plot_df <- do.call(
+  rbind,
+  lapply(seq_along(outcomes), function(i) {
+    y   <- outcomes[i]
+    mod <- es_models_list[[i]]
+    vc  <- es_vcovs_list[[i]]
+    
+    df <- extract_es(mod, vc, ref_year)
+    if (is.null(df)) return(NULL)
+    df$outcome <- y
+    df
+  })
+)
+
+p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
+  # grey vertical band for the reference year
+  annotate(
+    "rect",
+    xmin = ref_year - 0.5, xmax = ref_year + 0.5,
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.3, fill = "grey70"
+  ) +
+  # horizontal zero line
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+  # connected line and points
+  geom_line(colour = "black") +
+  geom_point(colour = "black", size = 2) +
+  # confidence intervals
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.15, colour = "black") +
+  # one panel per outcome
+  facet_wrap(~ outcome, scales = "free_y") +
+  # clean layout
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title = element_text(size = 13, face = "bold")
+  ) +
+  labs(
+   # title = "Dynamic DiD (Event Study): Year × Afghan pre-settlement exposure",
+    x = "Year",
+    y = "Year × Afghan pre-settlement exposure"
+  )
+
+print(p_es)
+
+ggsave(
+  filename = "event_study_afghan_settlement.png",
+  plot     = p_es,
+  width    = 9,
+  height   = 7,
+  bg       = "white"
+)
+
+
+```
+
+
+
+
+
+# Supply Side Analysis
+
+
+### Table 2: Supply side: summary statistics
+
+```{r}
+
+
+construction <- read_dta("construction_final.dta") %>%
+  filter(year != 1403)
+
+vars <- c(
+  "total_permits", "residential_permits",
+  "total_land", "residential_land",
+  "total_floor", "residential_floor",
+  "total_units", "residential_units",
+  "afghan_pop", "ntl", "pop_density"
+)
+
+## Keep only variables that are present in the data
+vars <- vars[vars %in% names(construction)]
+
+## 3. Compute summary statistics
+summ_list <- lapply(vars, function(v) {
+  x <- construction[[v]]
+  x <- x[!is.na(x)]
+  c(
+    N      = length(x),
+    Mean   = mean(x),
+    SD     = sd(x),
+    Min    = min(x),
+    P25    = as.numeric(quantile(x, 0.25)),
+    Median = as.numeric(quantile(x, 0.50)),
+    P75    = as.numeric(quantile(x, 0.75)),
+    Max    = max(x)
+  )
+})
+
+summary_table <- do.call(rbind, summ_list)
+summary_table <- data.frame(
+  Variable = vars,
+  summary_table,
+  row.names = NULL,
+  check.names = FALSE
+)
+
+## 4. Optional: round numeric columns for display/LaTeX
+num_cols <- setdiff(names(summary_table), "Variable")
+summary_table[num_cols] <- lapply(summary_table[num_cols], function(z) round(z, 3))
+summary_table$N <- as.integer(summary_table$N)
+
+## 5. Print table in R
+print(summary_table)
+
+## 6. Export to LaTeX
+latex_table <- xtable(
+  summary_table,
+  caption = "Summary statistics: construction dataset",
+  label   = "tab:summary_construction"
+)
+
+print(
+  latex_table,
+  include.rownames = FALSE,
+  file = "summary_construction.tex"
+)
+
+```
+
+
+
+
+### Table 4:  IV-DiD 
+
+
+
+```{r}
+
+
+construction <- read_dta("construction_final.dta")
+
+construction$Province <- factor(construction$Province)
+construction$year     <- as.factor(construction$year)
+construction$quarter  <- as.factor(construction$quart)
+
+# ===== 2) Drop 1403 (2024) ===== # this happens because we do not have inflow of of Afghans in 2024
+construction <- subset(construction, year != 1403)
+
+# ===== 3) Import 1375 census & merge instrument component =====
+sar <- read_xlsx("Sarshomari_1375.xlsx")  # has Province, Afghans, ...
+sar$Share_allAfghans <- sar$Afghans / sum(sar$Afghans, na.rm = TRUE)
+sar_keep <- sar[, c("Province", "Share_allAfghans")]
+
+construction <- merge(construction, sar_keep, by = "Province", all.x = TRUE)
+
+# ===== 4) Define post, endogenous, and instruments =====
+construction$post        <- as.integer(construction$year %in% c(1401, 1402))
+construction$treat_endog <- construction$post * construction$afghan_pct
+construction$instr1      <- construction$post * construction$Share_allAfghans   # historical (shift-share)
+construction$instr2      <- construction$post * construction$banned             # policy-based
+
+# ===== 5) Controls, FE, outcomes =====
+ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+outcomes <- c(
+  "total_permits","residential_permits",
+  "total_land","residential_land",
+  "total_floor","residential_floor",
+  "total_units","residential_units"
+)
+
+# ===== 6) Storage for LaTeX (OLS and IV) =====
+ols_models_list <- list()
+iv_models_list  <- list()
+ols_ses_list    <- list()
+iv_ses_list     <- list()
+
+# ===== 7) Loop over outcomes =====
+for (y in outcomes) {
+  cat("\n======================================\nOutcome:", y, "\n======================================\n")
+
+  # ---------- 7A) Baseline DiD (OLS, no IV) ----------
+  fml_ols <- as.formula(paste0(
+    y, " ~ treat_endog + ", ctrl_rhs
+  ))
+
+  ols <- lm(fml_ols, data = construction)
+
+  # rows actually used by the model (after na.omit)
+  mf_ols  <- model.frame(ols)
+  idx_ols <- match(rownames(mf_ols), rownames(construction))
+
+  # Province  clustering
+  V_ols_prov <- cluster.vcov(
+    ols,
+    construction$Province[idx_ols]
+  )
+
+  ols_models_list[[y]] <- ols
+  ols_ses_list[[y]]    <- sqrt(diag(V_ols_prov))
+
+  # ---------- 7B) IV–DiD (2SLS with two instruments) ----------
+  fml_iv <- as.formula(paste0(
+    y, " ~  + ", ctrl_rhs, " + treat_endog | ",
+    " + ", ctrl_rhs, " + instr1 + instr2"
+  ))
+
+  m <- ivreg(fml_iv, data = construction)
+
+  mf_iv  <- model.frame(m)
+  idx_iv <- match(rownames(mf_iv), rownames(construction))
+
+  V_prov <- cluster.vcov(
+    m,
+    construction$Province[idx_iv]
+  )
+
+  # print ONLY IV–DiD results
+  print(coeftest(m, vcov = V_prov))
+
+  iv_models_list[[y]] <- m
+  iv_ses_list[[y]]    <- sqrt(diag(V_prov))
+
+  # ---------- 7C) First-stage joint F for instr1 & instr2 ----------
+  fml_fs <- as.formula(paste0(
+    "treat_endog ~ instr1 + instr2 + ", ctrl_rhs
+  ))
+
+  fs <- lm(fml_fs, data = construction)
+
+  mf_fs  <- model.frame(fs)
+  idx_fs <- match(rownames(mf_fs), rownames(construction))
+
+  V_prov_fs <- cluster.vcov(
+    fs,
+    construction$Province[idx_fs]
+  )
+
+  cat("\n-- Province-clustered first-stage joint F (instr1 & instr2) --\n")
+  print(waldtest(fs, . ~ . - instr1 - instr2, vcov = V_prov_fs))
+}
+
+# Align lists just in case
+iv_models_list  <- Filter(Negate(is.null), iv_models_list)
+ols_models_list <- ols_models_list[names(iv_models_list)]
+ols_ses_list    <- ols_ses_list[names(iv_models_list)]
+iv_ses_list     <- iv_ses_list[names(iv_models_list)]
+
+# ==================================================
+# 8. Build LaTeX: Panel A (OLS DiD) + Panel B (IV–DiD)
+# ==================================================
+
+# Panel A: Baseline DiD (no IV)
+panelA_latex <- capture.output(
+  stargazer(
+    ols_models_list,
+    se = ols_ses_list,
+    type = "latex",
+    header = FALSE,
+    table  = FALSE,
+    dep.var.labels.include = FALSE,
+    column.labels   = names(ols_models_list),
+    column.separate = rep(1, length(ols_models_list)),
+    omit = c("factor\\(", "afghan_pct", "ntl", "pop_density"),
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# Panel B: IV–DiD (2SLS with two instruments)
+panelB_latex <- capture.output(
+  stargazer(
+    iv_models_list,
+    se = iv_ses_list,
+    type = "latex",
+    header = FALSE,
+    table  = FALSE,
+    dep.var.labels.include = FALSE,
+    column.labels   = names(iv_models_list),
+    column.separate = rep(1, length(iv_models_list)),
+    omit = c("factor\\(", "afghan_pct", "ntl", "pop_density",
+             "instr1", "instr2"),
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share (2SLS)",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+full_latex <- c(
+  "\\begin{table}[!htbp]\\centering",
+  "\\caption{Difference-in-differences estimates: construction outcomes}",
+  "\\label{tab:construction_did_iv}",
+  "\\begin{center}",
+  "\\textbf{Panel A: Baseline DiD (no IV)}\\\\",
+  panelA_latex,
+  "\\\\[1em]",
+  "\\textbf{Panel B: IV--DiD (2SLS with two instruments)}\\\\",
+  panelB_latex,
+  "\\end{center}",
+  "\\end{table}"
+)
+
+writeLines(full_latex, "table_construction_did_iv.tex")
+
+
+
+```
+
+
+
+# Appendix
+
+### Figure 2: Heat Maps- Afghan Share(2023 vs 1996)
+
+
+```{r}
+
+## 1) Read Iran shapefile + data
+iran <- sf::st_read(
+  "Mapping/iranmap/irn_admbnda_adm1_unhcr_20190514.shp"
+) %>%
+  rename(Province = ADM1_EN)
+
+sarshomari_1375 <- read_xlsx("Sarshomari_1375.xlsx")
+LFS             <- read_dta("LFS.dta")
+
+## 2) 1996 – make it PERCENT (Afghans / Total * 100)
+sarshomari_1375 <- sarshomari_1375 %>%
+  mutate(
+    Afghans = as.numeric(Afghans),
+    Total   = as.numeric(Total),
+    Afghan_pct_1375 = 100 * Afghans / Total
+  ) %>%
+  select(Province, Afghan_pct_1375)
+
+## 3) 1402 – LFS subset and province-level percent
+LFS402 <- LFS %>% filter(year == 402)
+
+lfs_1402 <- LFS402 %>%
+  rename(Province = province_name,
+         afghan_pct_1402=afghan_pct)
+
+## 4) Merge both years to map
+iran <- iran %>%
+  left_join(sarshomari_1375, by = "Province") %>%
+  left_join(lfs_1402,        by = "Province")
+
+iran_border <- sf::st_union(iran)
+
+## 5) Long format for faceting
+iran_long <- iran %>%
+  select(Province, Afghan_pct_1375, afghan_pct_1402, geometry) %>%
+  pivot_longer(
+    cols      = c(Afghan_pct_1375, afghan_pct_1402),
+    names_to  = "year",
+    values_to = "afghan_share"
+  ) %>%
+  mutate(
+    year = dplyr::recode(
+      year,
+      "Afghan_pct_1375" = "Afghan Population Share,1996",
+      "afghan_pct_1402" = "Afghan Population Share,2023"
+    ),
+    year = factor(
+      year,
+      levels = c("Afghan Population Share,1996",
+                 "Afghan Population Share,2023")
+    )
+  )
+
+## 6) Palette + common range
+blue_pal  <- colorRampPalette(c("white", "#08519c"))(100)
+val_range <- range(iran_long$afghan_share, na.rm = TRUE)
+
+## 6.5) Correlation + significance stars (ONE value)
+corr_data <- iran %>%
+  st_drop_geometry() %>%
+  select(Afghan_pct_1375, afghan_pct_1402) %>%
+  na.omit()
+
+corr_test <- cor.test(
+  corr_data$Afghan_pct_1375,
+  corr_data$afghan_pct_1402
+)
+
+corr_val <- unname(corr_test$estimate)
+p_val    <- corr_test$p.value
+
+stars <- {
+  if (p_val < 0.001) {
+    "***"
+  } else if (p_val < 0.01) {
+    "**"
+  } else if (p_val < 0.05) {
+    "*"
+  } else {
+    ""
+  }
+}
+
+corr_label <- sprintf("Correlation (1996 vs 2023) = %.3f%s",
+                      corr_val, stars)
+
+## 7) Final two-panel map with ONE centered correlation caption
+ggplot() +
+  geom_sf(
+    data  = iran_long,
+    aes(fill = afghan_share),
+    color = "grey70",
+    size  = 0.3
+  ) +
+  geom_sf(
+    data        = iran_border,
+    fill        = NA,
+    color       = "black",
+    size        = 0.6,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ year, ncol = 2) +
+  scale_fill_gradientn(
+    colours  = blue_pal,
+    na.value = "#f0f0f0",
+    limits   = val_range,
+    name     = "Share (%)"
+  ) +
+  labs(caption = corr_label) +
+  theme_void() +
+  theme(
+    legend.position   = "bottom",
+    strip.text        = element_text(size = 11, face = "bold"),
+    plot.margin       = margin(5, 5, 5, 5),
+    plot.caption      = element_text(hjust = 0.5, vjust = 1,
+                                     size = 10, face = "bold")
+  )
+ggsave(
+  filename = "Afghan_Population_Share_1996_2023.png",
+  plot     = last_plot(),   # saves the most recent ggplot
+  width    = 10,            # inches
+  height   = 6,
+  dpi      = 300,
+  bg       = "white"           # high resolution
+)
+
+```
+
+
+
+
+
+### Figure 3: Heat Maps- Afghan Share(2020 vs 1996)
+
+```{r}
+
+## 1) Read Iran shapefile + data
+iran <- sf::st_read(
+  "Mapping/iranmap/irn_admbnda_adm1_unhcr_20190514.shp"
+) %>%
+  rename(Province = ADM1_EN)
+
+sarshomari_1375 <- read_xlsx("Sarshomari_1375.xlsx")
+LFS             <- read_dta("LFS.dta")
+
+## 2) 1996 – make it PERCENT (Afghans / Total * 100)
+sarshomari_1375 <- sarshomari_1375 %>%
+  mutate(
+    Afghans = as.numeric(Afghans),
+    Total   = as.numeric(Total),
+    Afghan_pct_1375 = 100 * Afghans / Total
+  ) %>%
+  select(Province, Afghan_pct_1375)
+
+## 3) 1399 – LFS subset and province-level percent
+LFS99 <- LFS %>% filter(year == 99)
+
+lfs_1399 <- LFS99 %>%
+  rename(Province = province_name,
+         afghan_pct_1399=afghan_pct)
+
+## 4) Merge both years to map
+iran <- iran %>%
+  left_join(sarshomari_1375, by = "Province") %>%
+  left_join(lfs_1399,        by = "Province")
+
+iran_border <- sf::st_union(iran)
+
+## 5) Long format for faceting
+iran_long <- iran %>%
+  select(Province, Afghan_pct_1375, afghan_pct_1399, geometry) %>%
+  pivot_longer(
+    cols      = c(Afghan_pct_1375, afghan_pct_1399),
+    names_to  = "year",
+    values_to = "afghan_share"
+  ) %>%
+  mutate(
+    year = dplyr::recode(
+      year,
+      "Afghan_pct_1375" = "Afghan Population Share,1996",
+      "afghan_pct_1399" = "Afghan Population Share,2020"
+    ),
+    year = factor(
+      year,
+      levels = c("Afghan Population Share,1996",
+                 "Afghan Population Share,2020")
+    )
+  )
+
+## 6) Palette + common range
+blue_pal  <- colorRampPalette(c("white", "#08519c"))(100)
+val_range <- range(iran_long$afghan_share, na.rm = TRUE)
+
+## 6.5) Correlation + significance stars (ONE value)
+corr_data <- iran %>%
+  st_drop_geometry() %>%
+  select(Afghan_pct_1375, afghan_pct_1399) %>%
+  na.omit()
+
+corr_test <- cor.test(
+  corr_data$Afghan_pct_1375,
+  corr_data$afghan_pct_1399
+)
+
+corr_val <- unname(corr_test$estimate)
+p_val    <- corr_test$p.value
+
+stars <- {
+  if (p_val < 0.001) {
+    "***"
+  } else if (p_val < 0.01) {
+    "**"
+  } else if (p_val < 0.05) {
+    "*"
+  } else {
+    ""
+  }
+}
+
+corr_label <- sprintf("Correlation (1996 vs 2020) = %.3f%s",
+                      corr_val, stars)
+
+## 7) Final two-panel map with ONE centered correlation caption
+ggplot() +
+  geom_sf(
+    data  = iran_long,
+    aes(fill = afghan_share),
+    color = "grey70",
+    size  = 0.3
+  ) +
+  geom_sf(
+    data        = iran_border,
+    fill        = NA,
+    color       = "black",
+    size        = 0.6,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~ year, ncol = 2) +
+  scale_fill_gradientn(
+    colours  = blue_pal,
+    na.value = "#f0f0f0",
+    limits   = val_range,
+    name     = "Share (%)"
+  ) +
+  labs(caption = corr_label) +
+  theme_void() +
+  theme(
+    legend.position   = "bottom",
+    strip.text        = element_text(size = 11, face = "bold"),
+    plot.margin       = margin(5, 5, 5, 5),
+    plot.caption      = element_text(hjust = 0.5, vjust = 1,
+                                     size = 10, face = "bold")
+  )
+
+
+ggsave(
+  filename = "Afghan_Population_Share_1996_2020.png",
+  plot     = last_plot(),   # saves the most recent ggplot
+  width    = 10,            # inches
+  height   = 6,
+  dpi      = 300,
+  bg       = "white"
+)
+
+```
+
+
+### Figure 4: Male Share of Iranians, Afghans and the rest in 2023 (LFS)
+```{r}
+
+LFS402 <- read_dta("LFS_individuals2023.dta")
+
+# 1. Prepare variables -----------------------------------------------------
+LFS402 <- LFS402 %>%
+  mutate(
+    male = if_else(gender == 1, 1,
+                   if_else(gender == 2, 0, NA_real_)),
+    nat_cat = factor(
+      nationality,
+      levels = c(1, 2, 3),
+      labels = c("Iranians", "Afghans", "Others")
+    )
+  )
+
+# 2. Survey design ---------------------------------------------------------
+des <- svydesign(ids = ~1, weights = ~IW_Yearly, data = LFS402)
+
+# 3. Weighted male share + CI ---------------------------------------------
+est <- svyby(~male, ~nat_cat, des, svymean, vartype = "se", na.rm = TRUE)
+
+est <- est %>%
+  mutate(
+    mean_pct = male * 100,
+    lower = (male - 1.96 * se) * 100,
+    upper = (male + 1.96 * se) * 100,
+    label_txt = sprintf("%.2f", male)
+  )
+
+# 4. Bar chart (Jordan-style greys) ---------------------------------------
+ggplot(est, aes(x = nat_cat, y = mean_pct, fill = nat_cat)) +
+
+  geom_col(width = 0.7, color = "black") +
+
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.15, color = "red", linewidth = 0.7) +
+
+  geom_text(aes(label = label_txt),
+            vjust = -0.5, size = 4) +
+
+  scale_fill_manual(
+    values = c(
+      "Iranians" = "#4D4D4D",   # dark grey
+      "Afghans"  = "#808080",   # medium grey
+      "Others"   = "#BFBFBF"    # light grey
+    ),
+    name = ""
+  ) +
+
+  labs(
+    x = "",
+    y = "Male (% of Population)"
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.x = element_blank()
+  )
+
+ggsave(
+  filename = "male_share2023.png",
+  plot     = last_plot(),
+  width    = 6,
+  height   = 4,
+  dpi      = 300,
+  bg       = "white"   # prevents black background
+)
+```
+
+
+
+### Figure 5: Population Pyramid, LFS 2023
+
+```{r}
+
+# 1. Prep data -------------------------------------------------------------
+LFS_pyr <- LFS402 %>%
+  filter(nationality %in% c(1, 2)) %>%                      # 1=Iranians, 2=Afghans
+  mutate(
+    age_num = suppressWarnings(as.numeric(as.character(age))),
+    wt      = suppressWarnings(as.numeric(as.character(IW_Yearly))),
+    nat = factor(nationality,
+                 levels = c(1, 2),
+                 labels = c("Iranians", "Afghans")),
+    sex = factor(gender,
+                 levels = c(1, 2),
+                 labels = c("Male", "Female")),
+    age_group = cut(
+      age_num,
+      breaks = c(-Inf, 0, 4, 9, 14, 19, 24, 29, 34, 39,
+                 44, 49, 54, 59, 64, 69, 74, 79, Inf),
+      labels = c("<1", "1-4", "5-9", "10-14", "15-19",
+                 "20-24", "25-29", "30-34", "35-39",
+                 "40-44", "45-49", "50-54", "55-59",
+                 "60-64", "65-69", "70-74", "75-79", "80+"),
+      right = TRUE
+    )
+  ) %>%
+  filter(!is.na(age_group), !is.na(sex), !is.na(nat), !is.na(wt))
+
+# 2. Weighted totals (population in thousands) -----------------------------
+pyr_df <- LFS_pyr %>%
+  group_by(nat, sex, age_group) %>%
+  summarise(pop = sum(wt, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    pop_thousands = pop / 1000,
+    plot_value = ifelse(sex == "Male", -pop_thousands, pop_thousands)
+  )
+
+max_pop <- max(abs(pyr_df$plot_value), na.rm = TRUE)
+
+ggplot(pyr_df, aes(x = age_group, y = plot_value, fill = sex)) +
+  geom_col(width = 0.9, colour = "black") +
+  coord_flip() +
+  facet_wrap(~nat, nrow = 1, scales = "free_x") +
+  scale_y_continuous(
+    labels = abs,
+    breaks = function(x) pretty(x, n = 5)   # <-- ensures visible axis labels per panel
+  ) +
+  scale_fill_manual(
+    values = c("Male" = "#4D4D4D", "Female" = "#BFBFBF"),
+    name = ""
+  ) +
+  labs(
+    x = "",
+    y = "Population in Thousands"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.major.y = element_blank()
+  )
+ggsave(
+  filename = "Population Pyramid2023.png",
+  plot     = last_plot(),
+  width    = 6,
+  height   = 4,
+  dpi      = 300,
+  bg       = "white"   
+)
+
+```
+
