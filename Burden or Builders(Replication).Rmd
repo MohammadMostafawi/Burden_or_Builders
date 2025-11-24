@@ -517,7 +517,7 @@ cat(
 
 
 
-### Main Analysis With Post-2022. 
+### Table 4: Main Analysis With Post-2022. 
 ```{r}
 ## ==================================================
 ##  Baseline DiD (no IV) and IV–DiD (two IVs)
@@ -822,7 +822,7 @@ print(
 
 
 
-### Table 4:  IV-DiD 
+### Table 5:  IV-DiD 
 
 
 
@@ -1011,7 +1011,7 @@ writeLines(full_latex, "table_construction_did_iv.tex")
 ### Robustness Checks
 
 
-### Table 5(Appendix): DiD of Consumption outcomes
+### Table 6(Appendix): DiD of Consumption outcomes
 ```{r}
 
  ## ==================================================
@@ -1350,7 +1350,7 @@ ggsave(
 
 
 
-###  DiD Construction
+### Table 7:  DiD Construction
 ```{r}
 
  ## ==================================================
@@ -1464,7 +1464,7 @@ cat(did_table_tex, sep = "\n",
 ```
 
 
-### Event Study Construction
+### Figure 7: Event Study Construction
 
 ```{r}
 
