@@ -517,321 +517,237 @@ cat(
 
 
 
-### Table 5(Appendix): DiD 
+### Main Analysis With Post-2022. 
 ```{r}
-
- ## ==================================================
-## Continuous DiD: Afghan pre-settlement exposure × post
+## ==================================================
+##  Baseline DiD (no IV) and IV–DiD (two IVs)
+##    + export to LaTeX as Table 1 (Panel A/B)
 ## ==================================================
 
-# Post dummy: 1400–1402 are post
-consumption$post_did <- as.integer(consumption$year %in% c(1400, 1401, 1402))
-
-# Continuous DiD treatment: pre-settlement share × post
-# (afghan_share75 is the pre-settlement exposure)
-# Rename the pre-settlement exposure variable (old: afghan_share75)
 consumption <- consumption %>%
-  mutate (afghan_settlement_pct96 = afghan_share75 * 100)
-
-# afghan_settlement_share96:
-#   Share of Afghans in each province relative to the *province's total population* in 1996.
-#   This is the "pre-settlement exposure" variable used in the DiD identification strategy
-#   (similar to Rozo 2021). Higher values indicate provinces that historically hosted a
-#   larger Afghan presence relative to their own native population.
-
-# Note the difference from afghan_share96 (used in the IV-DiD):
-#   - afghan_settlement_share96 = Afghans_prov_1996 / total_population_prov_1996
-#       → exposure of the *local population* to Afghans historically.
-#
-#   - afghan_share96 = Afghans_prov_1996 / total_Afghans_1996
-#       → province's share of the *national Afghan population* in 1996.
-
-consumption$treat_did <- consumption$post_did * consumption$afghan_settlement_pct96
+  filter(year %in% 1397:1402) %>%
+  filter(complete.cases(across(all_of(c(vars_summ, "weight")))))
 
 
-# Containers for models and clustered SEs
-did_models <- list()
-did_ses    <- list()
+
+##  Construct afghan_share96 (province share of total Afghans in 1996)
+consumption <- consumption %>%
+  group_by(Province) %>%
+  mutate(
+    # Provincial Afghan count in 1996 (same within province)
+    Afghans_prov = first(Afghans)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Total Afghan population in 1996 across provinces
+    total_Afghans_1996 = sum(Afghans_prov, na.rm = TRUE),
+    # Province share of national Afghan total
+    afghan_share96      = Afghans_prov / total_Afghans_1996
+  ) %>%
+  select(-Afghans_prov, -total_Afghans_1996)
+
+
+##  Define banned provinces (for second IV)
+forbidden_provinces <- c(
+  "East Azerbaijan","West Azerbaijan","Ardabil","Zanjan",
+  "Kurdistan","Kermanshah","Ilam","Chaharmahal and Bakhtiari",
+  "Kohgiluyeh and Boyer-Ahmad","North Khorasan","Gilan",
+  "Mazandaran","Sistan and Baluchestan","Khuzestan",
+  "Hamadan","Lorestan"
+)
+
+# List of controls (Year and Province included for FE)
+ctrls <- c(
+  "ur","Num_HH_Members","Num_Male",
+  "Num_Under14","Num_Over65",
+  "Education_Level_HH_Head","Marital_Status_HH_Head",
+  "ntl","pop_density","Year","Province"
+)
+
+# Build RHS of controls with explicit factor() for categorical vars
+cat_vars <- c("ur","Education_Level_HH_Head","Marital_Status_HH_Head","Year","Province")
+num_vars <- setdiff(ctrls, cat_vars)
+ctrl_rhs <- paste(
+  c(sprintf("factor(%s)", cat_vars), num_vars),
+  collapse = " + "
+)
+
+# Outcomes
+outcomes <- c(
+  "log_housing","log_total","log_food",
+  "log_durables","log_education","log_transportation",
+  "nroom","floor"
+)
+
+
+##  Clean numeric variables that may be stored as strings
+consumption <- consumption %>%
+  mutate(
+    nroom = as.numeric(as.character(nroom)),
+    floor = as.numeric(as.character(floor))
+  )
+
+
+##  Treatment indicators and instruments
+
+# Post-period dummy (Persian calendar)
+consumption$post <- as.integer(consumption$year %in% c(1401, 1402))
+
+# Endogenous treatment: post × Afghan share
+consumption$treat_endog <- consumption$post * consumption$afghan_pct
+
+# Banned provinces indicator
+consumption$Province <- as.character(consumption$Province)
+consumption$banned   <- as.integer(consumption$Province %in% forbidden_provinces)
+consumption$Province <- factor(consumption$Province)
+
+# IV 1: post × afghan_share96
+consumption$instr_iv <- consumption$post * consumption$afghan_share96
+
+# IV 2: post × banned
+consumption$instr_banned <- consumption$post * consumption$banned
+# containers for models and clustered SEs
+ols_models <- list()   # baseline DiD
+ols_ses    <- list()
+
+iv_models  <- list()   # IV–DiD (2SLS)
+iv_ses     <- list()
 
 for (y in outcomes) {
   cat("\n======================================\n")
   cat("Outcome:", y, "\n")
   cat("======================================\n")
-  
-  # DiD specification:
-  #   - treat_did is the key DiD term: afghan_share75 × post_did
-  #   - ctrl_rhs already includes Year and Province FE and other controls
-  fml <- as.formula(paste0(
-    y, " ~ treat_did + ", ctrl_rhs
-  ))
-  
+
+  # same sample definition for OLS and IV (so results are comparable)
   needed <- unique(c(
-    y,
-    "treat_did",
-    ctrls,
-    "weight",
-    "afghan_settlement_pct96"
+    y, "post","afghan_pct","treat_endog",
+    "instr_iv","instr_banned",
+    ctrls, "weight"
   ))
-  
   dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
-  
-  # Weighted OLS with clustered SE at Province level
-  m  <- lm(fml, data = dsub, weights = weight)
-  vc <- vcovCL(m, cluster = ~ Province)
-  
-  did_models[[y]] <- m
-  did_ses[[y]]    <- sqrt(diag(vc))
-  
-  # Print regression with clustered SE
-  print(coeftest(m, vcov = vc))
+
+  ## ----------  Baseline DiD (no IV) ----------
+  # OLS: outcome on afghan_pct + treat_endog + controls + Year/Province FE
+  fml_ols <- as.formula(paste0(
+    y, " ~  + ", ctrl_rhs, " + treat_endog"
+  ))
+
+  m_ols <- lm(fml_ols, data = dsub, weights = weight)
+  vc_ols <- vcovCL(m_ols, cluster = ~ Province)
+  se_ols <- sqrt(diag(vc_ols))
+
+  ols_models[[y]] <- m_ols
+  ols_ses[[y]]    <- se_ols
+
+  ## ----------  IV–DiD (two IVs) ----------
+  # 2SLS: treat_endog instrumented by instr_iv & instr_banned
+  fml_iv <- as.formula(paste0(
+    y, " ~  + ", ctrl_rhs, " + treat_endog | ",
+    " + ", ctrl_rhs, " + instr_iv + instr_banned"
+  ))
+
+  m_iv <- ivreg(fml_iv, data = dsub, weights = weight)
+  vc_iv <- vcovCL(m_iv, cluster = ~ Province)
+  se_iv <- sqrt(diag(vc_iv))
+
+  iv_models[[y]] <- m_iv
+  iv_ses[[y]]    <- se_iv
+
+  # print IV results to console (clustered by Province)
+  cat("\n--- IV–DiD (clustered SE, Province) ---\n")
+  print(coeftest(m_iv, vcov = vc_iv))
+  # =====  First-stage joint F for instr_iv & instr_banned =====
+  # First-stage regression: treat_endog on instruments + controls
+  fml_fs <- as.formula(paste0(
+    "treat_endog ~ instr_iv + instr_banned + ", ctrl_rhs
+  ))
+
+  fs <- lm(fml_fs, data = dsub, weights = weight)
+
+  cat("\n-- Province-clustered first-stage joint F (instr_iv & instr_banned) --\n")
+  fs_F <- waldtest(
+    fs,
+    . ~ . - instr_iv - instr_banned,
+    vcov = vcovCL(fs, cluster = ~ Province),
+    test = "F"
+  )
+  print(fs_F)
 }
 
-# Keep models in the same order as "outcomes"
-did_models_list <- unname(did_models[outcomes])
-did_ses_list    <- unname(did_ses[outcomes])
+# keep models in outcome order
+ols_models_list <- unname(ols_models[outcomes])
+ols_ses_list    <- unname(ols_ses[outcomes])
 
+iv_models_list  <- unname(iv_models[outcomes])
+iv_ses_list     <- unname(iv_ses[outcomes])
 
 ## ==================================================
-## LaTeX table: Continuous DiD (Afghan pre-settlement × post)
+##  Build LaTeX for Table 1 (Panel A / Panel B)
 ## ==================================================
 
-did_table_tex <- capture.output(
+# Panel A: Baseline DiD (no IV)
+# only treatment coefficient shown; FE & controls omitted from table
+panelA_latex <- capture.output(
   stargazer(
-    did_models_list,
-    se = did_ses_list,
+    ols_models_list,
+    se = ols_ses_list,
     type = "latex",
-    summary = FALSE,
-    header  = FALSE,
-    title   = "Continuous DiD: Afghan pre-settlement exposure and consumption outcomes",
-    label   = "tab:did_afghan_share75",
+    header = FALSE,
+    table  = FALSE,
+    title  = "Panel A: Baseline DiD (no IV)",
     dep.var.labels.include = FALSE,
-    column.labels   = outcomes,
+    column.labels  = outcomes,
     column.separate = rep(1, length(outcomes)),
-    keep = "treat_did",
-    covariate.labels = "Post × Afghan pre-settlement exposure",
+    omit = c("factor\\(", "afghan_pct"),   # hide FE + main share; keep DiD term
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share",
     notes = "Cluster-robust standard errors at the province level in parentheses."
   )
 )
 
-# Write LaTeX file
-cat(did_table_tex, sep = "\n",
-    file = "table_did_afghan_pct96.tex")
-
-
-
-```
-
-
-
-### Figure 6: Event Study
-
-
-
-```{r}
-## ==================================================
-## Dynamic DiD (event study):
-## Afghan pre-settlement exposure × Year (2020 ref.)
-## ==================================================
-
-
-# Years in the panel (Gregorian)
-years_all <- sort(unique(consumption$Year))
-ref_year  <- 2020L
-
-# Years that get their own interaction terms (all except 2020)
-es_years <- years_all[years_all != ref_year]
-
-# For each year t ≠ 2020 define:
-#   treat_es_t = afghan_settlement_share96 * 1{Year == t}
-# There is deliberately NO treat_es_2020 → β_2020 is normalized to zero.
-for (yr in es_years) {
-  varname <- paste0("treat_es_", yr)
-  consumption[[varname]] <- ifelse(
-    consumption$Year == yr,
-    consumption$afghan_settlement_pct96,
-    0
-  )
-}
-
-treat_es_vars <- paste0("treat_es_", es_years)
-
-# Containers for models and clustered vcov
-es_models <- list()
-es_ses    <- list()
-es_vcovs  <- list()
-
-for (y in outcomes) {
-  cat("\n======================================\n")
-  cat("Dynamic DiD – Outcome:", y, "\n")
-  cat("======================================\n")
-  
-  # Event-study specification:
-  #   y_pyt = sum_{t≠2020} β_t * (afghan_settlement_share96_p × 1{Year_t})
-  #           + Province FE + Year FE + controls + ε
-  fml_es <- as.formula(paste0(
-    y, " ~ ", ctrl_rhs, " + ", paste(treat_es_vars, collapse = " + ")
-  ))
-  
-  needed <- unique(c(
-    y,
-    "afghan_settlement_pct96",
-    "Year",
-    ctrls,
-    "weight",
-    treat_es_vars
-  ))
-  
-  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
-  
-  m_es  <- lm(fml_es, data = dsub, weights = weight)
-  vc_es <- vcovCL(m_es, cluster = ~ Province)
-  
-  es_models[[y]] <- m_es
-  es_ses[[y]]    <- sqrt(diag(vc_es))
-  es_vcovs[[y]]  <- vc_es
-  
-  print(coeftest(m_es, vcov = vc_es))
-}
-
-es_models_list <- unname(es_models[outcomes])
-es_ses_list    <- unname(es_ses[outcomes])
-es_vcovs_list  <- unname(es_vcovs[outcomes])
-
-
-## ==================================================
-## LaTeX table: Dynamic DiD (event study)
-## ==================================================
-
-es_table_tex <- capture.output(
+# Panel B: IV–DiD (2SLS with two instruments)
+panelB_latex <- capture.output(
   stargazer(
-    es_models_list,
-    se     = es_ses_list,
-    type   = "latex",
-    summary = FALSE,
-    header  = FALSE,
-    title   = "Dynamic DiD (event study) with Afghan pre-settlement exposure",
-    label   = "tab:event_study_afghan_settlement",
+    iv_models_list,
+    se = iv_ses_list,
+    type = "latex",
+    header = FALSE,
+    table  = FALSE,
+    title  = "Panel B: IV–DiD (2SLS, instruments: post×afghan\\_share96, post×banned)",
     dep.var.labels.include = FALSE,
-    column.labels   = outcomes,
+    column.labels  = outcomes,
     column.separate = rep(1, length(outcomes)),
-    keep   = "treat_es_",
-    notes  = "Cluster-robust standard errors at the province level in parentheses. Year 2020 is the reference period (effect normalized to zero)."
+    omit = c("factor\\(", "afghan_pct"),   # same omission rule as Panel A
+    keep = "treat_endog",
+    covariate.labels = "Post × Afghan share (IV)",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
   )
 )
 
-cat(es_table_tex, sep = "\n",
-    file = "table_event_study_afghan_settlement.tex")
+# write combined table to a single .tex file
+table1_file <- "table_consumption_did_iv_Post2022.tex"
 
-event_study_table_tex <- es_table_tex   # keep in environment
-
-
-## ==================================================
-## Event-study plot (faceted, 2020 = 0)
-## ==================================================
-
-# Extract dynamic coefficients for one model
-extract_es <- function(mod, vcov_mat, ref_year) {
-  cf   <- coef(mod)
-  vcv  <- diag(vcov_mat)
-  nm   <- names(cf)
-  
-  idx  <- grep("^treat_es_", nm)
-  if (length(idx) == 0) return(NULL)
-  
-  beta <- cf[idx]
-  se   <- sqrt(vcv[idx])
-  
-  years <- as.integer(sub("treat_es_", "", nm[idx]))
-  
-  df_es <- data.frame(
-    year  = years,
-    beta  = beta,
-    se    = se
-  )
-  
-  df_es$lower <- df_es$beta - 1.96 * df_es$se
-  df_es$upper <- df_es$beta + 1.96 * df_es$se
-  
-  # Add the reference year (2020) with zero effect and no CI
-  df_es <- rbind(
-    df_es,
-    data.frame(
-      year  = ref_year,
-      beta  = 0,
-      se    = NA_real_,
-      lower = NA_real_,
-      upper = NA_real_
-    )
-  )
-  
-  df_es[order(df_es$year), ]
-}
-
-# Build a single data frame for all outcomes
-es_plot_df <- do.call(
-  rbind,
-  lapply(seq_along(outcomes), function(i) {
-    y   <- outcomes[i]
-    mod <- es_models_list[[i]]
-    vc  <- es_vcovs_list[[i]]
-    
-    df <- extract_es(mod, vc, ref_year)
-    if (is.null(df)) return(NULL)
-    df$outcome <- y
-    df
-  })
+cat(
+  "% ==================================================\n",
+  "% Table 1: Baseline DiD and IV–DiD\n",
+  "% ==================================================\n",
+  "\\begin{table}[ht]\\centering\n",
+  "\\caption{Baseline DiD and IV–DiD estimates}\n",
+  "\\label{tab:did_ivdid}\n\n",
+  "% -------- Panel A --------\n",
+  "\\textbf{Panel A: Baseline DiD (no IV)}\\\\[0.5em]\n",
+  paste(panelA_latex, collapse = "\n"), "\n\n",
+  "% -------- Panel B --------\n",
+  "\\vspace{1em}\n",
+  "\\textbf{Panel B: IV--DiD (2SLS)}\\\\[0.5em]\n",
+  paste(panelB_latex, collapse = "\n"), "\n",
+  "\\end{table}\n",
+  file = table1_file
 )
 
-p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
-  # grey vertical band for the reference year
-  annotate(
-    "rect",
-    xmin = ref_year - 0.5, xmax = ref_year + 0.5,
-    ymin = -Inf, ymax = Inf,
-    alpha = 0.3, fill = "grey70"
-  ) +
-  # horizontal zero line
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
-  # connected line and points
-  geom_line(colour = "black") +
-  geom_point(colour = "black", size = 2) +
-  # confidence intervals
-  geom_errorbar(aes(ymin = lower, ymax = upper),
-                width = 0.15, colour = "black") +
-  # one panel per outcome
-  facet_wrap(~ outcome, scales = "free_y") +
-  # clean layout
-  theme_bw() +
-  theme(
-    strip.background = element_rect(fill = "white"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    panel.border = element_rect(colour = "black"),
-    axis.title.x = element_text(size = 11),
-    axis.title.y = element_text(size = 11),
-    plot.title = element_text(size = 13, face = "bold")
-  ) +
-  labs(
-   # title = "Dynamic DiD (Event Study): Year × Afghan pre-settlement exposure",
-    x = "Year",
-    y = "Year × Afghan pre-settlement exposure"
-  )
-
-print(p_es)
-
-ggsave(
-  filename = "event_study_afghan_settlement.png",
-  plot     = p_es,
-  width    = 9,
-  height   = 7,
-  bg       = "white"
-)
 
 
 ```
-
-
-
 
 
 # Supply Side Analysis
@@ -1084,7 +1000,696 @@ writeLines(full_latex, "table_construction_did_iv.tex")
 
 
 
+
+
+
+
+
+
 # Appendix
+
+### Robustness Checks
+
+
+### Table 5(Appendix): DiD of Consumption outcomes
+```{r}
+
+ ## ==================================================
+## Continuous DiD: Afghan pre-settlement exposure × post
+## ==================================================
+# List of controls (Year and Province included for FE)
+ctrls <- c(
+  "ur","Num_HH_Members","Num_Male",
+  "Num_Under14","Num_Over65",
+  "Education_Level_HH_Head","Marital_Status_HH_Head",
+  "ntl","pop_density","Year","Province"
+)
+
+# Build RHS of controls with explicit factor() for categorical vars
+cat_vars <- c("ur","Education_Level_HH_Head","Marital_Status_HH_Head","Year","Province")
+num_vars <- setdiff(ctrls, cat_vars)
+ctrl_rhs <- paste(
+  c(sprintf("factor(%s)", cat_vars), num_vars),
+  collapse = " + "
+)
+
+# Outcomes
+outcomes <- c(
+  "log_housing","log_total","log_food",
+  "log_durables","log_education","log_transportation",
+  "nroom","floor"
+)
+
+# Post dummy: 1400–1402 are post
+consumption$post_did <- as.integer(consumption$year %in% c(1400, 1401, 1402))
+
+# Continuous DiD treatment: pre-settlement share × post
+# (afghan_share75 is the pre-settlement exposure)
+# Rename the pre-settlement exposure variable (old: afghan_share75)
+consumption <- consumption %>%
+  mutate (afghan_settlement_pct96 = afghan_share75 * 100)
+
+# afghan_settlement_share96:
+#   Share of Afghans in each province relative to the *province's total population* in 1996.
+#   This is the "pre-settlement exposure" variable used in the DiD identification strategy
+#   (similar to Rozo 2021). Higher values indicate provinces that historically hosted a
+#   larger Afghan presence relative to their own native population.
+
+# Note the difference from afghan_share96 (used in the IV-DiD):
+#   - afghan_settlement_share96 = Afghans_prov_1996 / total_population_prov_1996
+#       → exposure of the *local population* to Afghans historically.
+#
+#   - afghan_share96 = Afghans_prov_1996 / total_Afghans_1996
+#       → province's share of the *national Afghan population* in 1996.
+
+consumption$treat_did <- consumption$post_did * consumption$afghan_settlement_pct96
+
+
+# Containers for models and clustered SEs
+did_models <- list()
+did_ses    <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # DiD specification:
+  #   - treat_did is the key DiD term: afghan_share75 × post_did
+  #   - ctrl_rhs already includes Year and Province FE and other controls
+  fml <- as.formula(paste0(
+    y, " ~ treat_did + ", ctrl_rhs
+  ))
+  
+  needed <- unique(c(
+    y,
+    "treat_did",
+    ctrls,
+    "weight",
+    "afghan_settlement_pct96"
+  ))
+  
+  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  
+  # Weighted OLS with clustered SE at Province level
+  m  <- lm(fml, data = dsub, weights = weight)
+  vc <- vcovCL(m, cluster = ~ Province)
+  
+  did_models[[y]] <- m
+  did_ses[[y]]    <- sqrt(diag(vc))
+  
+  # Print regression with clustered SE
+  print(coeftest(m, vcov = vc))
+}
+
+# Keep models in the same order as "outcomes"
+did_models_list <- unname(did_models[outcomes])
+did_ses_list    <- unname(did_ses[outcomes])
+
+
+## ==================================================
+## LaTeX table: Continuous DiD (Afghan pre-settlement × post)
+## ==================================================
+
+did_table_tex <- capture.output(
+  stargazer(
+    did_models_list,
+    se = did_ses_list,
+    type = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Continuous DiD: Afghan pre-settlement exposure and consumption outcomes",
+    label   = "tab:did_afghan_share75",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep = "treat_did",
+    covariate.labels = "Post × Afghan pre-settlement exposure",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# Write LaTeX file
+cat(did_table_tex, sep = "\n",
+    file = "table_did_afghan_pct96.tex")
+
+
+
+```
+
+
+
+### Figure 6: Event Study of consumption outcomes
+
+
+
+```{r}
+## ==================================================
+## Dynamic DiD (event study):
+## Afghan pre-settlement exposure × Year (2020 ref.)
+## ==================================================
+
+
+# Years in the panel (Gregorian)
+years_all <- sort(unique(consumption$Year))
+ref_year  <- 2020L
+
+# Years that get their own interaction terms (all except 2020)
+es_years <- years_all[years_all != ref_year]
+
+# For each year t ≠ 2020 define:
+#   treat_es_t = afghan_settlement_share96 * 1{Year == t}
+# There is deliberately NO treat_es_2020 → β_2020 is normalized to zero.
+for (yr in es_years) {
+  varname <- paste0("treat_es_", yr)
+  consumption[[varname]] <- ifelse(
+    consumption$Year == yr,
+    consumption$afghan_settlement_pct96,
+    0
+  )
+}
+
+treat_es_vars <- paste0("treat_es_", es_years)
+
+# Containers for models and clustered vcov
+es_models <- list()
+es_ses    <- list()
+es_vcovs  <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Dynamic DiD – Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # Event-study specification:
+  #   y_pyt = sum_{t≠2020} β_t * (afghan_settlement_share96_p × 1{Year_t})
+  #           + Province FE + Year FE + controls + ε
+  fml_es <- as.formula(paste0(
+    y, " ~ ", ctrl_rhs, " + ", paste(treat_es_vars, collapse = " + ")
+  ))
+  
+  needed <- unique(c(
+    y,
+    "afghan_settlement_pct96",
+    "Year",
+    ctrls,
+    "weight",
+    treat_es_vars
+  ))
+  
+  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  
+  m_es  <- lm(fml_es, data = dsub, weights = weight)
+  vc_es <- vcovCL(m_es, cluster = ~ Province)
+  
+  es_models[[y]] <- m_es
+  es_ses[[y]]    <- sqrt(diag(vc_es))
+  es_vcovs[[y]]  <- vc_es
+  
+  print(coeftest(m_es, vcov = vc_es))
+}
+
+es_models_list <- unname(es_models[outcomes])
+es_ses_list    <- unname(es_ses[outcomes])
+es_vcovs_list  <- unname(es_vcovs[outcomes])
+
+
+## ==================================================
+## LaTeX table: Dynamic DiD (event study)
+## ==================================================
+
+es_table_tex <- capture.output(
+  stargazer(
+    es_models_list,
+    se     = es_ses_list,
+    type   = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Dynamic DiD (event study) with Afghan pre-settlement exposure",
+    label   = "tab:event_study_afghan_settlement",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep   = "treat_es_",
+    notes  = "Cluster-robust standard errors at the province level in parentheses. Year 2020 is the reference period (effect normalized to zero)."
+  )
+)
+
+cat(es_table_tex, sep = "\n",
+    file = "table_event_study_afghan_settlement.tex")
+
+event_study_table_tex <- es_table_tex   # keep in environment
+
+
+## ==================================================
+## Event-study plot (faceted, 2020 = 0)
+## ==================================================
+
+# Extract dynamic coefficients for one model
+extract_es <- function(mod, vcov_mat, ref_year) {
+  cf   <- coef(mod)
+  vcv  <- diag(vcov_mat)
+  nm   <- names(cf)
+  
+  idx  <- grep("^treat_es_", nm)
+  if (length(idx) == 0) return(NULL)
+  
+  beta <- cf[idx]
+  se   <- sqrt(vcv[idx])
+  
+  years <- as.integer(sub("treat_es_", "", nm[idx]))
+  
+  df_es <- data.frame(
+    year  = years,
+    beta  = beta,
+    se    = se
+  )
+  
+  df_es$lower <- df_es$beta - 1.96 * df_es$se
+  df_es$upper <- df_es$beta + 1.96 * df_es$se
+  
+  # Add the reference year (2020) with zero effect and no CI
+  df_es <- rbind(
+    df_es,
+    data.frame(
+      year  = ref_year,
+      beta  = 0,
+      se    = NA_real_,
+      lower = NA_real_,
+      upper = NA_real_
+    )
+  )
+  
+  df_es[order(df_es$year), ]
+}
+
+# Build a single data frame for all outcomes
+es_plot_df <- do.call(
+  rbind,
+  lapply(seq_along(outcomes), function(i) {
+    y   <- outcomes[i]
+    mod <- es_models_list[[i]]
+    vc  <- es_vcovs_list[[i]]
+    
+    df <- extract_es(mod, vc, ref_year)
+    if (is.null(df)) return(NULL)
+    df$outcome <- y
+    df
+  })
+)
+
+p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
+  # grey vertical band for the reference year
+  annotate(
+    "rect",
+    xmin = ref_year - 0.5, xmax = ref_year + 0.5,
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.3, fill = "grey70"
+  ) +
+  # horizontal zero line
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+  # connected line and points
+  geom_line(colour = "black") +
+  geom_point(colour = "black", size = 2) +
+  # confidence intervals
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.15, colour = "black") +
+  # one panel per outcome
+  facet_wrap(~ outcome, scales = "free_y") +
+  # clean layout
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title = element_text(size = 13, face = "bold")
+  ) +
+  labs(
+   # title = "Dynamic DiD (Event Study): Year × Afghan pre-settlement exposure",
+    x = "Year",
+    y = "Year × Afghan pre-settlement exposure"
+  )
+
+print(p_es)
+
+ggsave(
+  filename = "event_study_afghan_settlement.png",
+  plot     = p_es,
+  width    = 9,
+  height   = 7,
+  bg       = "white"
+)
+
+
+```
+
+
+
+
+
+###  DiD Construction
+```{r}
+
+ ## ==================================================
+## Continuous DiD: Afghan pre-settlement exposure × post
+## ==================================================
+
+
+ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+outcomes <- c(
+  "total_permits","residential_permits",
+  "total_land","residential_land",
+  "total_floor","residential_floor",
+  "total_units","residential_units"
+)
+
+construction <- read_dta("construction_final.dta")
+
+construction$Province <- factor(construction$Province)
+construction$year     <- as.factor(construction$year)
+construction$quarter  <- as.factor(construction$quart)
+construction <- subset(construction, year != 1403)
+
+
+# Post dummy: 1400–1402 are post
+construction$post_did <- as.integer(construction$year %in% c(1400,1401, 1402))
+
+# Continuous DiD treatment: pre-settlement share × post
+# (afghan_share75 is the pre-settlement exposure)
+# Rename the pre-settlement exposure variable (old: afghan_share75)
+construction <- construction %>%
+  mutate (afghan_settlement_pct96 = Share_75 * 100)
+
+# afghan_settlement_share96:
+#   Share of Afghans in each province relative to the *province's total population* in 1996.
+#   This is the "pre-settlement exposure" variable used in the DiD identification strategy
+#   (similar to Rozo 2021). Higher values indicate provinces that historically hosted a
+#   larger Afghan presence relative to their own native population.
+
+# Note the difference from afghan_share96 (used in the IV-DiD):
+#   - afghan_settlement_share96 = Afghans_prov_1996 / total_population_prov_1996
+#       → exposure of the *local population* to Afghans historically.
+#
+#   - afghan_share96 = Afghans_prov_1996 / total_Afghans_1996
+#       → province's share of the *national Afghan population* in 1996.
+
+construction$treat_did <- construction$post_did * construction$afghan_settlement_pct96
+
+
+# Containers for models and clustered SEs
+did_models <- list()
+did_ses    <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # DiD specification:
+  #   - treat_did is the key DiD term: afghan_share75 × post_did
+  #   - ctrl_rhs already includes Year and Province FE and other controls
+  fml <- as.formula(paste0(
+    y, " ~ treat_did + ", ctrl_rhs
+  ))
+  
+  
+  
+  # Weighted OLS with clustered SE at Province level
+  m  <- lm(fml, data = construction)
+  vc <- vcovCL(m, cluster = ~ Province)
+  
+  did_models[[y]] <- m
+  did_ses[[y]]    <- sqrt(diag(vc))
+  
+  # Print regression with clustered SE
+  print(coeftest(m, vcov = vc))
+}
+
+# Keep models in the same order as "outcomes"
+did_models_list <- unname(did_models[outcomes])
+did_ses_list    <- unname(did_ses[outcomes])
+
+
+## ==================================================
+## LaTeX table: Continuous DiD (Afghan pre-settlement × post)
+## ==================================================
+
+did_table_tex <- capture.output(
+  stargazer(
+    did_models_list,
+    se = did_ses_list,
+    type = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Continuous DiD: Afghan pre-settlement exposure and construction outcomes",
+    label   = "tab:did_afghan_share75",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep = "treat_did",
+    covariate.labels = "Post × Afghan pre-settlement exposure",
+    notes = "Cluster-robust standard errors at the province level in parentheses."
+  )
+)
+
+# Write LaTeX file
+cat(did_table_tex, sep = "\n",
+    file = "table_did_afghan_pct96_construction_post2021.tex")
+
+
+
+```
+
+
+### Event Study Construction
+
+```{r}
+
+
+ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+outcomes <- c(
+  "total_permits","residential_permits",
+  "total_land","residential_land",
+  "total_floor","residential_floor",
+  "total_units","residential_units"
+)
+
+construction <- read_dta("construction_final.dta")
+
+construction$Province <- factor(construction$Province)
+construction$year     <- as.factor(construction$year)
+construction$quarter  <- as.factor(construction$quart)
+construction <- subset(construction, year != 1403)
+
+construction <- construction %>%
+  mutate (afghan_settlement_pct96 = Share_75 * 100)
+
+construction <- construction %>%
+  mutate(
+    Year = dplyr::recode(
+      year,
+      `1397` = 2018,
+      `1398` = 2019,
+      `1399` = 2020,
+      `1400` = 2021,
+      `1401` = 2022,
+      `1402` = 2023
+      )
+  )
+
+
+ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+
+# Years in the panel (Gregorian)
+years_all <- sort(unique(construction$Year))
+ref_year  <- 2020L
+
+# Years that get their own interaction terms (all except 2020)
+es_years <- years_all[years_all != ref_year]
+
+# For each year t ≠ 2020 define:
+#   treat_es_t = afghan_settlement_share96 * 1{Year == t}
+# There is deliberately NO treat_es_2020 → β_2020 is normalized to zero.
+for (yr in es_years) {
+  varname <- paste0("treat_es_", yr)
+  construction[[varname]] <- ifelse(
+    construction$Year == yr,
+    construction$afghan_settlement_pct96,
+    0
+  )
+}
+
+treat_es_vars <- paste0("treat_es_", es_years)
+
+# Containers for models and clustered vcov
+es_models <- list()
+es_ses    <- list()
+es_vcovs  <- list()
+
+for (y in outcomes) {
+  cat("\n======================================\n")
+  cat("Dynamic DiD – Outcome:", y, "\n")
+  cat("======================================\n")
+  
+  # Event-study specification:
+  #   y_pyt = sum_{t≠2020} β_t * (afghan_settlement_share96_p × 1{Year_t})
+  #           + Province FE + Year FE + controls + ε
+  fml_es <- as.formula(paste0(
+    y, " ~ ", ctrl_rhs, " + ", paste(treat_es_vars, collapse = " + ")
+  ))
+  
+ 
+
+  m_es  <- lm(fml_es, data = construction)
+  vc_es <- vcovCL(m_es, cluster = ~ Province)
+  
+  es_models[[y]] <- m_es
+  es_ses[[y]]    <- sqrt(diag(vc_es))
+  es_vcovs[[y]]  <- vc_es
+  
+  print(coeftest(m_es, vcov = vc_es))
+}
+
+es_models_list <- unname(es_models[outcomes])
+es_ses_list    <- unname(es_ses[outcomes])
+es_vcovs_list  <- unname(es_vcovs[outcomes])
+
+
+## ==================================================
+## LaTeX table: Dynamic DiD (event study)
+## ==================================================
+
+es_table_tex <- capture.output(
+  stargazer(
+    es_models_list,
+    se     = es_ses_list,
+    type   = "latex",
+    summary = FALSE,
+    header  = FALSE,
+    title   = "Dynamic DiD (event study) with Afghan pre-settlement exposure",
+    label   = "tab:event_study_afghan_settlement",
+    dep.var.labels.include = FALSE,
+    column.labels   = outcomes,
+    column.separate = rep(1, length(outcomes)),
+    keep   = "treat_es_",
+    notes  = "Cluster-robust standard errors at the province level in parentheses. Year 2020 is the reference period (effect normalized to zero)."
+  )
+)
+
+cat(es_table_tex, sep = "\n",
+    file = "table_event_study_afghan_settlement_construction.tex")
+
+event_study_table_tex <- es_table_tex   # keep in environment
+
+
+## ==================================================
+## Event-study plot 
+## ==================================================
+
+# Extract dynamic coefficients for one model
+extract_es <- function(mod, vcov_mat, ref_year) {
+  cf   <- coef(mod)
+  vcv  <- diag(vcov_mat)
+  nm   <- names(cf)
+  
+  idx  <- grep("^treat_es_", nm)
+  if (length(idx) == 0) return(NULL)
+  
+  beta <- cf[idx]
+  se   <- sqrt(vcv[idx])
+  
+  years <- as.integer(sub("treat_es_", "", nm[idx]))
+  
+  df_es <- data.frame(
+    year  = years,
+    beta  = beta,
+    se    = se
+  )
+  
+  df_es$lower <- df_es$beta - 1.96 * df_es$se
+  df_es$upper <- df_es$beta + 1.96 * df_es$se
+  
+  # Add the reference year (2020) with zero effect and no CI
+  df_es <- rbind(
+    df_es,
+    data.frame(
+      year  = ref_year,
+      beta  = 0,
+      se    = NA_real_,
+      lower = NA_real_,
+      upper = NA_real_
+    )
+  )
+  
+  df_es[order(df_es$year), ]
+}
+
+# Build a single data frame for all outcomes
+es_plot_df <- do.call(
+  rbind,
+  lapply(seq_along(outcomes), function(i) {
+    y   <- outcomes[i]
+    mod <- es_models_list[[i]]
+    vc  <- es_vcovs_list[[i]]
+    
+    df <- extract_es(mod, vc, ref_year)
+    if (is.null(df)) return(NULL)
+    df$outcome <- y
+    df
+  })
+)
+
+p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
+  # grey vertical band for the reference year
+  annotate(
+    "rect",
+    xmin = ref_year - 0.5, xmax = ref_year + 0.5,
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.3, fill = "grey70"
+  ) +
+  # horizontal zero line
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "red") +
+  # connected line and points
+  geom_line(colour = "black") +
+  geom_point(colour = "black", size = 2) +
+  # confidence intervals
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.15, colour = "black") +
+  # one panel per outcome
+  facet_wrap(~ outcome, scales = "free_y") +
+  # clean layout
+  theme_bw() +
+  theme(
+    strip.background = element_rect(fill = "white"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black"),
+    axis.title.x = element_text(size = 11),
+    axis.title.y = element_text(size = 11),
+    plot.title = element_text(size = 13, face = "bold")
+  ) +
+  labs(
+   # title = "Dynamic DiD (Event Study): Year × Afghan pre-settlement exposure",
+    x = "Year",
+    y = "Year × Afghan pre-settlement exposure"
+  )
+
+print(p_es)
+
+ggsave(
+  filename = "event_study_afghan_settlement_constructionpost-2021.png",
+  plot     = p_es,
+  width    = 9,
+  height   = 7,
+  bg       = "white"
+)
+
+
+```
+
 
 ### Figure 2: Heat Maps- Afghan Share(2023 vs 1996)
 
@@ -1503,4 +2108,16 @@ ggsave(
 )
 
 ```
+
+
+
+
+
+
+
+
+
+
+
+
 
