@@ -165,28 +165,15 @@ consumption <- consumption %>%
 ## Summary Stats
 ### Table 1: consumption Summary stat 
 
+
+
+
 ```{r}
 ## ==================================================
-## Summary statistics: consumption data (analysis sample)
+## Weighted Summary Statistics: Household Consumption Sample (1397–1402)
 ## ==================================================
 
-# Reconstruct total consumption (replace old total)
-consumption <- consumption %>% 
-  mutate(
-    total = food +
-            catering_food +
-            housing +
-            education +
-            transportation +
-            communication +
-            durables +
-            health,
-    
-    # log(total + 1) to avoid log(0) cases
-    log_total = log(total + 1)
-  )
-
-# Fix miscoded income earners and numeric issues
+# 1) Clean variables
 consumption <- consumption %>%
   mutate(
     Num_Income_Earners = ifelse(Num_Income_Earners == 99, 0, Num_Income_Earners),
@@ -194,87 +181,124 @@ consumption <- consumption %>%
     floor = as.numeric(as.character(floor))
   )
 
-# Variables for the table (same as before, but log_total updated)
+# 2) Construct total consumption and logs
+consumption <- consumption %>% 
+  mutate(
+    total = food + catering_food + housing + education +
+            transportation + communication + durables + health,
+
+    log_total = log(total + 1),
+    log_nroom = log(nroom + 1),
+    log_floor = log(floor + 1)
+  )
+
+# 3) Variables to summarize
 vars_summ <- c(
   "log_housing","log_total","log_food",
   "log_durables","log_education","log_transportation",
-  "nroom","floor",
-  "afghan_pct",
+  "log_nroom","log_floor",
   "Num_HH_Members","Num_Male","Num_Under14",
-  "Num_Over65","Num_Income_Earners",
-  "ntl","pop_density"
+  "Num_Over65","Num_Income_Earners"
 )
+
 vars_summ <- intersect(vars_summ, names(consumption))
 
-
-# Analysis sample
+# 4) Analysis sample
 cons_sample <- consumption %>%
   filter(year %in% 1397:1402) %>%
   filter(complete.cases(across(all_of(c(vars_summ, "weight")))))
 
-
-# Weighted summary function
+# 5) Weighted summary function
 summ_fun_w <- function(x, w) {
-  x <- as.numeric(x)
-  w <- as.numeric(w)
-
-  w <- w / sum(w)  # normalize
-
-  # weighted percentiles
-  ord <- order(x)
-  x_sorted <- x[ord]
-  w_sorted <- w[ord]
-  cum_w <- cumsum(w_sorted)
-
-  w_quant <- function(p) x_sorted[which(cum_w >= p)[1]]
-
-  c(
-    N    = length(x),
-    mean = sum(w * x),
-    sd   = sqrt(sum(w * (x - sum(w * x))^2)),
-    min  = min(x),
-    p25  = w_quant(0.25),
-    p50  = w_quant(0.50),
-    p75  = w_quant(0.75),
-    max  = max(x)
-  )
+  x <- as.numeric(x); w <- as.numeric(w)
+  ok <- is.finite(x) & is.finite(w)
+  x <- x[ok]; w <- w[ok]
+  w <- w / sum(w)
+  m  <- sum(w * x)
+  sd <- sqrt(sum(w * (x - m)^2))
+  c(Mean = m, SD = sd, Min = min(x), Max = max(x))
 }
 
-# Build weighted summary table
-cons_summary_table <- t(
-  sapply(vars_summ, function(v)
-    summ_fun_w(cons_sample[[v]], cons_sample$weight)
-  )
-)
+# 6) Years to consider
+years_use <- 1397:1402
 
-cons_summary_table <- as.data.frame(cons_summary_table)
-rownames(cons_summary_table) <- vars_summ
+# 7) Build summary matrix for each year
+summ_list <- lapply(years_use, function(yr) {
+  d <- cons_sample %>% filter(year == yr)
+  out <- t(sapply(vars_summ, function(v) summ_fun_w(d[[v]], d$weight)))
+  colnames(out) <- c("Mean","SD","Min","Max")
+  out
+})
 
-# Show in R
-print(round(cons_summary_table, 3))
+cons_summary_mat <- do.call(cbind, summ_list)
+rownames(cons_summary_mat) <- vars_summ
 
-# Export to LaTeX
-cons_summary_tex <- capture.output(
-  stargazer(
-    cons_summary_table,
-    type = "latex",
-    summary  = FALSE,
-    header   = FALSE,
-    rownames = TRUE,
-    title = "Weighted summary statistics: household consumption sample",
-    label = "tab:summary_consumption",
-    digits = 3
-  )
-)
+# 8) Footer calculations
 
-cat(cons_summary_tex, sep = "\n",
-    file = "table_summary_consumption.tex")
+# Total households (unweighted)
+footer_obs <- sapply(years_use, function(yr) {
+  cons_sample %>% filter(year == yr) %>% nrow()
+})
 
+# Correct weighted population = weight × household size
+footer_wobs <- sapply(years_use, function(yr) {
+  d <- cons_sample %>% filter(year == yr)
+  sum(d$weight * d$Num_HH_Members, na.rm = TRUE)
+})
+
+# 9) Export LaTeX table
+
+sink("table_summary_consumption_by_year.tex")
+
+cat("\\begin{table}[htbp]\n")
+cat("\\centering\n")
+cat("\\caption{Weighted Summary Statistics: Household Consumption Sample, 1397--1402}\n")
+cat("\\label{tab:summary_consumption_by_year}\n")
+
+cat("\\begin{tabular}{l", paste(rep("cccc", length(years_use)), collapse = ""), "}\n", sep = "")
+cat("\\hline\\hline\n")
+
+# Header row: years
+cat(" & ",
+    paste(sprintf("\\multicolumn{4}{c}{%d}", years_use), collapse = " & "),
+    " \\\\\n", sep = "")
+
+# Header row: Mean SD Min Max
+cat(" & ",
+    paste(rep(c("Mean","SD","Min","Max"), length(years_use)), collapse = " & "),
+    " \\\\\n", sep = "")
+cat("\\hline\n")
+
+# Data rows
+for (i in seq_along(vars_summ)) {
+  cat(vars_summ[i], " & ",
+      paste(format(round(cons_summary_mat[i, ], 3), nsmall = 3), collapse = " & "),
+      " \\\\\n", sep = "")
+}
+
+cat("\\hline\n")
+
+# Footer: total households
+cat("\\multicolumn{1}{l}{Total Households} & ",
+    paste(footer_obs, collapse = " & "), " \\\\\n", sep = "")
+
+# Footer: weighted population (formatted with comma separator)
+cat("\\multicolumn{1}{l}{Weighted Population} & ",
+    paste(format(round(footer_wobs, 0), big.mark=","), collapse = " & "),
+    " \\\\\n", sep = "")
+
+cat("\\hline\\hline\n")
+cat("\\end{tabular}\n")
+cat("\\end{table}\n")
+
+sink()
+
+# Also show the numeric output in R console
+print(round(cons_summary_mat, 3))
+footer_obs
+footer_wobs
 
 ```
-
-
-
 
 
 
@@ -342,16 +366,10 @@ ctrl_rhs <- paste(
 outcomes <- c(
   "log_housing","log_total","log_food",
   "log_durables","log_education","log_transportation",
-  "nroom","floor"
+  "log_nroom","log_floor"
 )
 
 
-##  Clean numeric variables that may be stored as strings
-consumption <- consumption %>%
-  mutate(
-    nroom = as.numeric(as.character(nroom)),
-    floor = as.numeric(as.character(floor))
-  )
 
 
 ##  Treatment indicators and instruments
@@ -516,309 +534,132 @@ cat(
 ```
 
 
-
-### Table 4: Main Analysis With Post-2022. 
-```{r}
-## ==================================================
-##  Baseline DiD (no IV) and IV–DiD (two IVs)
-##    + export to LaTeX as Table 1 (Panel A/B)
-## ==================================================
-
-consumption <- consumption %>%
-  filter(year %in% 1397:1402) %>%
-  filter(complete.cases(across(all_of(c(vars_summ, "weight")))))
-
-
-
-##  Construct afghan_share96 (province share of total Afghans in 1996)
-consumption <- consumption %>%
-  group_by(Province) %>%
-  mutate(
-    # Provincial Afghan count in 1996 (same within province)
-    Afghans_prov = first(Afghans)
-  ) %>%
-  ungroup() %>%
-  mutate(
-    # Total Afghan population in 1996 across provinces
-    total_Afghans_1996 = sum(Afghans_prov, na.rm = TRUE),
-    # Province share of national Afghan total
-    afghan_share96      = Afghans_prov / total_Afghans_1996
-  ) %>%
-  select(-Afghans_prov, -total_Afghans_1996)
-
-
-##  Define banned provinces (for second IV)
-forbidden_provinces <- c(
-  "East Azerbaijan","West Azerbaijan","Ardabil","Zanjan",
-  "Kurdistan","Kermanshah","Ilam","Chaharmahal and Bakhtiari",
-  "Kohgiluyeh and Boyer-Ahmad","North Khorasan","Gilan",
-  "Mazandaran","Sistan and Baluchestan","Khuzestan",
-  "Hamadan","Lorestan"
-)
-
-# List of controls (Year and Province included for FE)
-ctrls <- c(
-  "ur","Num_HH_Members","Num_Male",
-  "Num_Under14","Num_Over65",
-  "Education_Level_HH_Head","Marital_Status_HH_Head",
-  "ntl","pop_density","Year","Province"
-)
-
-# Build RHS of controls with explicit factor() for categorical vars
-cat_vars <- c("ur","Education_Level_HH_Head","Marital_Status_HH_Head","Year","Province")
-num_vars <- setdiff(ctrls, cat_vars)
-ctrl_rhs <- paste(
-  c(sprintf("factor(%s)", cat_vars), num_vars),
-  collapse = " + "
-)
-
-# Outcomes
-outcomes <- c(
-  "log_housing","log_total","log_food",
-  "log_durables","log_education","log_transportation",
-  "nroom","floor"
-)
-
-
-##  Clean numeric variables that may be stored as strings
-consumption <- consumption %>%
-  mutate(
-    nroom = as.numeric(as.character(nroom)),
-    floor = as.numeric(as.character(floor))
-  )
-
-
-##  Treatment indicators and instruments
-
-# Post-period dummy (Persian calendar)
-consumption$post <- as.integer(consumption$year %in% c(1401, 1402))
-
-# Endogenous treatment: post × Afghan share
-consumption$treat_endog <- consumption$post * consumption$afghan_pct
-
-# Banned provinces indicator
-consumption$Province <- as.character(consumption$Province)
-consumption$banned   <- as.integer(consumption$Province %in% forbidden_provinces)
-consumption$Province <- factor(consumption$Province)
-
-# IV 1: post × afghan_share96
-consumption$instr_iv <- consumption$post * consumption$afghan_share96
-
-# IV 2: post × banned
-consumption$instr_banned <- consumption$post * consumption$banned
-# containers for models and clustered SEs
-ols_models <- list()   # baseline DiD
-ols_ses    <- list()
-
-iv_models  <- list()   # IV–DiD (2SLS)
-iv_ses     <- list()
-
-for (y in outcomes) {
-  cat("\n======================================\n")
-  cat("Outcome:", y, "\n")
-  cat("======================================\n")
-
-  # same sample definition for OLS and IV (so results are comparable)
-  needed <- unique(c(
-    y, "post","afghan_pct","treat_endog",
-    "instr_iv","instr_banned",
-    ctrls, "weight"
-  ))
-  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
-
-  ## ----------  Baseline DiD (no IV) ----------
-  # OLS: outcome on afghan_pct + treat_endog + controls + Year/Province FE
-  fml_ols <- as.formula(paste0(
-    y, " ~  + ", ctrl_rhs, " + treat_endog"
-  ))
-
-  m_ols <- lm(fml_ols, data = dsub, weights = weight)
-  vc_ols <- vcovCL(m_ols, cluster = ~ Province)
-  se_ols <- sqrt(diag(vc_ols))
-
-  ols_models[[y]] <- m_ols
-  ols_ses[[y]]    <- se_ols
-
-  ## ----------  IV–DiD (two IVs) ----------
-  # 2SLS: treat_endog instrumented by instr_iv & instr_banned
-  fml_iv <- as.formula(paste0(
-    y, " ~  + ", ctrl_rhs, " + treat_endog | ",
-    " + ", ctrl_rhs, " + instr_iv + instr_banned"
-  ))
-
-  m_iv <- ivreg(fml_iv, data = dsub, weights = weight)
-  vc_iv <- vcovCL(m_iv, cluster = ~ Province)
-  se_iv <- sqrt(diag(vc_iv))
-
-  iv_models[[y]] <- m_iv
-  iv_ses[[y]]    <- se_iv
-
-  # print IV results to console (clustered by Province)
-  cat("\n--- IV–DiD (clustered SE, Province) ---\n")
-  print(coeftest(m_iv, vcov = vc_iv))
-  # =====  First-stage joint F for instr_iv & instr_banned =====
-  # First-stage regression: treat_endog on instruments + controls
-  fml_fs <- as.formula(paste0(
-    "treat_endog ~ instr_iv + instr_banned + ", ctrl_rhs
-  ))
-
-  fs <- lm(fml_fs, data = dsub, weights = weight)
-
-  cat("\n-- Province-clustered first-stage joint F (instr_iv & instr_banned) --\n")
-  fs_F <- waldtest(
-    fs,
-    . ~ . - instr_iv - instr_banned,
-    vcov = vcovCL(fs, cluster = ~ Province),
-    test = "F"
-  )
-  print(fs_F)
-}
-
-# keep models in outcome order
-ols_models_list <- unname(ols_models[outcomes])
-ols_ses_list    <- unname(ols_ses[outcomes])
-
-iv_models_list  <- unname(iv_models[outcomes])
-iv_ses_list     <- unname(iv_ses[outcomes])
-
-## ==================================================
-##  Build LaTeX for Table 1 (Panel A / Panel B)
-## ==================================================
-
-# Panel A: Baseline DiD (no IV)
-# only treatment coefficient shown; FE & controls omitted from table
-panelA_latex <- capture.output(
-  stargazer(
-    ols_models_list,
-    se = ols_ses_list,
-    type = "latex",
-    header = FALSE,
-    table  = FALSE,
-    title  = "Panel A: Baseline DiD (no IV)",
-    dep.var.labels.include = FALSE,
-    column.labels  = outcomes,
-    column.separate = rep(1, length(outcomes)),
-    omit = c("factor\\(", "afghan_pct"),   # hide FE + main share; keep DiD term
-    keep = "treat_endog",
-    covariate.labels = "Post × Afghan share",
-    notes = "Cluster-robust standard errors at the province level in parentheses."
-  )
-)
-
-# Panel B: IV–DiD (2SLS with two instruments)
-panelB_latex <- capture.output(
-  stargazer(
-    iv_models_list,
-    se = iv_ses_list,
-    type = "latex",
-    header = FALSE,
-    table  = FALSE,
-    title  = "Panel B: IV–DiD (2SLS, instruments: post×afghan\\_share96, post×banned)",
-    dep.var.labels.include = FALSE,
-    column.labels  = outcomes,
-    column.separate = rep(1, length(outcomes)),
-    omit = c("factor\\(", "afghan_pct"),   # same omission rule as Panel A
-    keep = "treat_endog",
-    covariate.labels = "Post × Afghan share (IV)",
-    notes = "Cluster-robust standard errors at the province level in parentheses."
-  )
-)
-
-# write combined table to a single .tex file
-table1_file <- "table_consumption_did_iv_Post2022.tex"
-
-cat(
-  "% ==================================================\n",
-  "% Table 1: Baseline DiD and IV–DiD\n",
-  "% ==================================================\n",
-  "\\begin{table}[ht]\\centering\n",
-  "\\caption{Baseline DiD and IV–DiD estimates}\n",
-  "\\label{tab:did_ivdid}\n\n",
-  "% -------- Panel A --------\n",
-  "\\textbf{Panel A: Baseline DiD (no IV)}\\\\[0.5em]\n",
-  paste(panelA_latex, collapse = "\n"), "\n\n",
-  "% -------- Panel B --------\n",
-  "\\vspace{1em}\n",
-  "\\textbf{Panel B: IV--DiD (2SLS)}\\\\[0.5em]\n",
-  paste(panelB_latex, collapse = "\n"), "\n",
-  "\\end{table}\n",
-  file = table1_file
-)
-
-
-
-```
-
-
 # Supply Side Analysis
 
 
 ### Table 2: Supply side: summary statistics
 
+
 ```{r}
 
-
+# 1) Read and clean
 construction <- read_dta("construction_final.dta") %>%
-  filter(year != 1403)
+  filter(year != 1403)   # drop 1403 if present
 
-vars <- c(
+# 2) Level outcomes and logs
+level_outcomes <- c(
   "total_permits", "residential_permits",
   "total_land", "residential_land",
   "total_floor", "residential_floor",
-  "total_units", "residential_units",
-  "afghan_pop", "ntl", "pop_density"
+  "total_units", "residential_units"
 )
 
-## Keep only variables that are present in the data
+# Create log variables
+for (v in level_outcomes) {
+  newvar <- paste0("log_", v)
+  if (v %in% names(construction)) {
+    construction[[newvar]] <- log(construction[[v]] + 1)
+  }
+}
+
+vars <- c(
+  "log_total_permits", "log_residential_permits",
+  "log_total_land", "log_residential_land",
+  "log_total_floor", "log_residential_floor",
+  "log_total_units", "log_residential_units"
+)
+
+# Keep only variables that exist
 vars <- vars[vars %in% names(construction)]
 
-## 3. Compute summary statistics
-summ_list <- lapply(vars, function(v) {
-  x <- construction[[v]]
-  x <- x[!is.na(x)]
+# 3) Years to include
+years_use <- sort(unique(construction$year))  # e.g. 1397:1402
+
+# 4) Unweighted summary function (Mean, SD, Min, Max)
+summ_fun <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
   c(
-    N      = length(x),
-    Mean   = mean(x),
-    SD     = sd(x),
-    Min    = min(x),
-    P25    = as.numeric(quantile(x, 0.25)),
-    Median = as.numeric(quantile(x, 0.50)),
-    P75    = as.numeric(quantile(x, 0.75)),
-    Max    = max(x)
+    Mean = mean(x),
+    SD   = sd(x),
+    Min  = min(x),
+    Max  = max(x)
   )
+}
+
+# 5) Build summary matrix per year
+summ_list <- lapply(years_use, function(yr) {
+  d_yr <- construction %>% filter(year == yr)
+  out <- t(sapply(vars, function(v) summ_fun(d_yr[[v]])))
+  colnames(out) <- c("Mean", "SD", "Min", "Max")
+  out
 })
 
-summary_table <- do.call(rbind, summ_list)
-summary_table <- data.frame(
-  Variable = vars,
-  summary_table,
-  row.names = NULL,
-  check.names = FALSE
-)
+summary_mat <- do.call(cbind, summ_list)
+rownames(summary_mat) <- vars
 
-## 4. Optional: round numeric columns for display/LaTeX
-num_cols <- setdiff(names(summary_table), "Variable")
-summary_table[num_cols] <- lapply(summary_table[num_cols], function(z) round(z, 3))
-summary_table$N <- as.integer(summary_table$N)
+# 6) Total observations per year (footer)
+footer_obs <- sapply(years_use, function(yr) {
+  construction %>% filter(year == yr) %>% nrow()
+})
 
-## 5. Print table in R
-print(summary_table)
+# 7) (Optional) round for display
+summary_mat_round <- round(summary_mat, 3)
 
-## 6. Export to LaTeX
-latex_table <- xtable(
-  summary_table,
-  caption = "Summary statistics: construction dataset",
-  label   = "tab:summary_construction"
-)
+# Check in R
+print(summary_mat_round)
+print(footer_obs)
 
-print(
-  latex_table,
-  include.rownames = FALSE,
-  file = "summary_construction.tex"
-)
+# 8) Export LaTeX table (same structure as demand-side table)
+latex_file <- "summary_construction_by_year.tex"
+sink(latex_file)
+
+cat("\\begin{table}[htbp]\n")
+cat("\\centering\n")
+cat("\\caption{Summary Statistics: Construction Outcomes by Year}\n")
+cat("\\label{tab:summary_construction_by_year}\n")
+cat("\\resizebox{\\textwidth}{!}{%\n")
+
+# one "l" + 4 columns per year
+cat("\\begin{tabular}{l", paste(rep("cccc", length(years_use)), collapse = ""), "}\n", sep = "")
+cat("\\hline\\hline\n")
+
+# Header row: years
+cat(" & ",
+    paste(sprintf("\\multicolumn{4}{c}{%d}", years_use), collapse = " & "),
+    " \\\\\n", sep = "")
+
+# Header row: Mean SD Min Max
+cat(" & ",
+    paste(rep(c("Mean","SD","Min","Max"), length(years_use)), collapse = " & "),
+    " \\\\\n", sep = "")
+cat("\\hline\n")
+
+# Data rows
+for (i in seq_along(vars)) {
+  row_vals <- format(summary_mat_round[i, ], nsmall = 3)
+  cat(vars[i], " & ",
+      paste(row_vals, collapse = " & "),
+      " \\\\\n", sep = "")
+}
+
+cat("\\hline\n")
+
+# Footer: total observations, spanning 4 cols per year
+cat("\\multicolumn{1}{l}{Total Observations} ")
+for (j in seq_along(years_use)) {
+  cat("& \\multicolumn{4}{c}{", footer_obs[j], "} ", sep = "")
+}
+cat("\\\\\n")
+
+cat("\\hline\\hline\n")
+cat("\\end{tabular}\n")
+cat("}%\n")  # end resizebox
+cat("\\end{table}\n")
+
+sink()
 
 ```
-
 
 
 
@@ -838,6 +679,7 @@ construction$quarter  <- as.factor(construction$quart)
 # ===== 2) Drop 1403 (2024) ===== # this happens because we do not have inflow of of Afghans in 2024
 construction <- subset(construction, year != 1403)
 
+
 # ===== 3) Import 1375 census & merge instrument component =====
 sar <- read_xlsx("Sarshomari_1375.xlsx")  # has Province, Afghans, ...
 sar$Share_allAfghans <- sar$Afghans / sum(sar$Afghans, na.rm = TRUE)
@@ -846,19 +688,35 @@ sar_keep <- sar[, c("Province", "Share_allAfghans")]
 construction <- merge(construction, sar_keep, by = "Province", all.x = TRUE)
 
 # ===== 4) Define post, endogenous, and instruments =====
-construction$post        <- as.integer(construction$year %in% c(1401, 1402))
+construction$post        <- as.integer(construction$year %in% c(1400,1401, 1402))
 construction$treat_endog <- construction$post * construction$afghan_pct
 construction$instr1      <- construction$post * construction$Share_allAfghans   # historical (shift-share)
 construction$instr2      <- construction$post * construction$banned             # policy-based
 
 # ===== 5) Controls, FE, outcomes =====
 ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
-outcomes <- c(
-  "total_permits","residential_permits",
-  "total_land","residential_land",
-  "total_floor","residential_floor",
-  "total_units","residential_units"
+
+
+
+level_outcomes <- c(
+  "total_permits", "residential_permits",
+  "total_land", "residential_land",
+  "total_floor", "residential_floor",
+  "total_units", "residential_units"
 )
+
+# Create log variables with prefix log_
+for(v in level_outcomes){
+  newvar <- paste0("log_", v)
+  construction[[newvar]] <- log(construction[[v]] + 1)
+}
+outcomes <- c(
+  "log_total_permits", "log_residential_permits",
+  "log_total_land", "log_residential_land",
+  "log_total_floor", "log_residential_floor",
+  "log_total_units", "log_residential_units"
+)
+
 
 # ===== 6) Storage for LaTeX (OLS and IV) =====
 ols_models_list <- list()
@@ -1014,6 +872,9 @@ writeLines(full_latex, "table_construction_did_iv.tex")
 ### Table 6(Appendix): DiD of Consumption outcomes
 ```{r}
 
+## ِDropping Sistan and Baluchestan. 11 is the code of Sistan and Baluchestan
+consumption_did<- subset(consumption, province !=11)
+
  ## ==================================================
 ## Continuous DiD: Afghan pre-settlement exposure × post
 ## ==================================================
@@ -1037,16 +898,16 @@ ctrl_rhs <- paste(
 outcomes <- c(
   "log_housing","log_total","log_food",
   "log_durables","log_education","log_transportation",
-  "nroom","floor"
+  "log_nroom","log_floor"
 )
 
 # Post dummy: 1400–1402 are post
-consumption$post_did <- as.integer(consumption$year %in% c(1400, 1401, 1402))
+consumption_did$post_did <- as.integer(consumption_did$year %in% c(1400, 1401, 1402))
 
 # Continuous DiD treatment: pre-settlement share × post
 # (afghan_share75 is the pre-settlement exposure)
 # Rename the pre-settlement exposure variable (old: afghan_share75)
-consumption <- consumption %>%
+consumption_did <- consumption_did %>%
   mutate (afghan_settlement_pct96 = afghan_share75 * 100)
 
 # afghan_settlement_share96:
@@ -1062,7 +923,7 @@ consumption <- consumption %>%
 #   - afghan_share96 = Afghans_prov_1996 / total_Afghans_1996
 #       → province's share of the *national Afghan population* in 1996.
 
-consumption$treat_did <- consumption$post_did * consumption$afghan_settlement_pct96
+consumption_did$treat_did <- consumption_did$post_did * consumption_did$afghan_settlement_pct96
 
 
 # Containers for models and clustered SEs
@@ -1089,7 +950,7 @@ for (y in outcomes) {
     "afghan_settlement_pct96"
   ))
   
-  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  dsub <- consumption_did[complete.cases(consumption_did[, needed]), needed, drop = FALSE]
   
   # Weighted OLS with clustered SE at Province level
   m  <- lm(fml, data = dsub, weights = weight)
@@ -1131,7 +992,7 @@ did_table_tex <- capture.output(
 
 # Write LaTeX file
 cat(did_table_tex, sep = "\n",
-    file = "table_did_afghan_pct96.tex")
+    file = "table_did_consumption.tex")
 
 
 
@@ -1151,7 +1012,7 @@ cat(did_table_tex, sep = "\n",
 
 
 # Years in the panel (Gregorian)
-years_all <- sort(unique(consumption$Year))
+years_all <- sort(unique(consumption_did$Year))
 ref_year  <- 2020L
 
 # Years that get their own interaction terms (all except 2020)
@@ -1162,9 +1023,9 @@ es_years <- years_all[years_all != ref_year]
 # There is deliberately NO treat_es_2020 → β_2020 is normalized to zero.
 for (yr in es_years) {
   varname <- paste0("treat_es_", yr)
-  consumption[[varname]] <- ifelse(
-    consumption$Year == yr,
-    consumption$afghan_settlement_pct96,
+  consumption_did[[varname]] <- ifelse(
+    consumption_did$Year == yr,
+    consumption_did$afghan_settlement_pct96,
     0
   )
 }
@@ -1197,7 +1058,7 @@ for (y in outcomes) {
     treat_es_vars
   ))
   
-  dsub <- consumption[complete.cases(consumption[, needed]), needed, drop = FALSE]
+  dsub <- consumption_did[complete.cases(consumption_did[, needed]), needed, drop = FALSE]
   
   m_es  <- lm(fml_es, data = dsub, weights = weight)
   vc_es <- vcovCL(m_es, cluster = ~ Province)
@@ -1236,7 +1097,7 @@ es_table_tex <- capture.output(
 )
 
 cat(es_table_tex, sep = "\n",
-    file = "table_event_study_afghan_settlement.tex")
+    file = "table_event_study_consumption.tex")
 
 event_study_table_tex <- es_table_tex   # keep in environment
 
@@ -1298,7 +1159,36 @@ es_plot_df <- do.call(
   })
 )
 
+## === NEW PART: reorder facets and rename them ===
+outcome_order <- c(
+  "log_housing",        # first (top-left)
+  "log_durables",
+  "log_education",
+  "log_food",
+  "log_total",
+  "log_transportation",
+  "log_nroom",          # last two
+  "log_floor"
+)
+
+es_plot_df$outcome <- factor(
+  es_plot_df$outcome,
+  levels = outcome_order,
+  labels = c(
+    "Log Housing",
+    "Log Durables",
+    "Log Education",
+    "Log Food",
+    "Log Total",
+    "Log Transportation",
+    "Log Nroom",
+    "Log Floor"
+  )
+)
+## === END NEW PART ===
+
 p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
+
   # grey vertical band for the reference year
   annotate(
     "rect",
@@ -1336,7 +1226,7 @@ p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
 print(p_es)
 
 ggsave(
-  filename = "event_study_afghan_settlement.png",
+  filename = "event_study_consumption.png",
   plot     = p_es,
   width    = 9,
   height   = 7,
@@ -1358,15 +1248,9 @@ ggsave(
 ## ==================================================
 
 
-ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
-outcomes <- c(
-  "total_permits","residential_permits",
-  "total_land","residential_land",
-  "total_floor","residential_floor",
-  "total_units","residential_units"
-)
 
 construction <- read_dta("construction_final.dta")
+construction<- subset(construction, province !=11)
 
 construction$Province <- factor(construction$Province)
 construction$year     <- as.factor(construction$year)
@@ -1398,6 +1282,27 @@ construction <- construction %>%
 
 construction$treat_did <- construction$post_did * construction$afghan_settlement_pct96
 
+ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+
+
+level_outcomes <- c(
+  "total_permits", "residential_permits",
+  "total_land", "residential_land",
+  "total_floor", "residential_floor",
+  "total_units", "residential_units"
+)
+
+# Create log variables with prefix log_
+for(v in level_outcomes){
+  newvar <- paste0("log_", v)
+  construction[[newvar]] <- log(construction[[v]] + 1)
+}
+outcomes <- c(
+  "log_total_permits", "log_residential_permits",
+  "log_total_land", "log_residential_land",
+  "log_total_floor", "log_residential_floor",
+  "log_total_units", "log_residential_units"
+)
 
 # Containers for models and clustered SEs
 did_models <- list()
@@ -1457,7 +1362,7 @@ did_table_tex <- capture.output(
 
 # Write LaTeX file
 cat(did_table_tex, sep = "\n",
-    file = "table_did_afghan_pct96_construction_post2021.tex")
+    file = "table_did_constructino.tex")
 
 
 
@@ -1469,20 +1374,13 @@ cat(did_table_tex, sep = "\n",
 ```{r}
 
 
-ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
-outcomes <- c(
-  "total_permits","residential_permits",
-  "total_land","residential_land",
-  "total_floor","residential_floor",
-  "total_units","residential_units"
-)
+
 
 construction <- read_dta("construction_final.dta")
-
+construction <- subset(construction, province !=11)
 construction$Province <- factor(construction$Province)
 construction$year     <- as.factor(construction$year)
 construction$quarter  <- as.factor(construction$quart)
-construction <- subset(construction, year != 1403)
 
 construction <- construction %>%
   mutate (afghan_settlement_pct96 = Share_75 * 100)
@@ -1502,6 +1400,27 @@ construction <- construction %>%
 
 
 ctrl_rhs <- "ntl + pop_density + factor(Province) + factor(year) + factor(quart)"
+
+level_outcomes <- c(
+  "total_permits", "residential_permits",
+  "total_land", "residential_land",
+  "total_floor", "residential_floor",
+  "total_units", "residential_units"
+)
+
+# Create log variables with prefix log_
+for(v in level_outcomes){
+  newvar <- paste0("log_", v)
+  construction[[newvar]] <- log(construction[[v]] + 1)
+}
+outcomes <- c(
+  "log_total_permits", "log_residential_permits",
+  "log_total_land", "log_residential_land",
+  "log_total_floor", "log_residential_floor",
+  "log_total_units", "log_residential_units"
+)
+
+
 
 # Years in the panel (Gregorian)
 years_all <- sort(unique(construction$Year))
@@ -1642,7 +1561,36 @@ es_plot_df <- do.call(
   })
 )
 
+## === NEW PART: set facet order + nice labels ===
+outcome_order <- c(
+  "log_total_permits",
+  "log_residential_permits",
+  "log_total_land",
+  "log_residential_land",
+  "log_total_floor",
+  "log_residential_floor",
+  "log_total_units",
+  "log_residential_units"
+)
+
+es_plot_df$outcome <- factor(
+  es_plot_df$outcome,
+  levels = outcome_order,
+  labels = c(
+    "Log Total Permits",
+    "Log Residential Permits",
+    "Log Total Land",
+    "Log Residential Land",
+    "Log Total Floor",
+    "Log Residential Floor",
+    "Log Total Units",
+    "Log Residential Units"
+  )
+)
+## === END NEW PART ===
+
 p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
+
   # grey vertical band for the reference year
   annotate(
     "rect",
@@ -1680,7 +1628,7 @@ p_es <- ggplot(es_plot_df, aes(x = year, y = beta)) +
 print(p_es)
 
 ggsave(
-  filename = "event_study_afghan_settlement_constructionpost-2021.png",
+  filename = "event_study_construction.png",
   plot     = p_es,
   width    = 9,
   height   = 7,
@@ -1963,6 +1911,65 @@ ggsave(
 ```
 
 
+
+### Banned Provinces
+```{r}
+## 1) Province-level banned indicator from construction
+cons_prov <- construction %>%
+  group_by(Province) %>%
+  summarise(
+    # assuming banned is 0/1; take max in case of multiple years
+    banned = max(banned, na.rm = TRUE)
+  )
+
+
+iran <- sf::st_read(
+  "Mapping/iranmap/irn_admbnda_adm1_unhcr_20190514.shp"
+) %>%
+  rename(Province = ADM1_EN) %>%
+  left_join(cons_prov, by = "Province")
+gg_banned <- ggplot() +
+  geom_sf(
+    data  = iran,
+    aes(fill = factor(banned)),
+    color = "grey50",
+    size  = 0.4
+  ) +
+  scale_fill_manual(
+    values = c("0" = "white", "1" = "red"),
+    labels = c("0" = "Allowed", "1" = "Banned"),
+    name   = ""
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    plot.margin     = margin(5, 5, 5, 5)
+  ) +
+  labs(
+    title = 
+  )
+
+print(gg_banned)
+
+ggsave(
+  filename = "banned_provinces_map.png",
+  plot     = gg_banned,
+  width    = 8,
+  height   = 6,
+  dpi      = 300,
+  bg       = "white"
+)
+
+```
+
+
+
+
+
+
+
+
+
 ### Figure 4: Male Share of Iranians, Afghans and the rest in 2023 (LFS)
 ```{r}
 
@@ -2113,6 +2120,10 @@ ggsave(
 
 
 
+
+
+
+```
 
 
 
